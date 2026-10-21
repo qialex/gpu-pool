@@ -9,6 +9,8 @@ import {
   optimizationPlan,
   detectContainerPort,
   hostPortFor,
+  blacklistFailedLoad,
+  burstAfterProbeFailures,
   burstStillWaiting,
   isServing,
   occupiesSlot,
@@ -103,6 +105,18 @@ describe("isServing", () => {
   })
 })
 
+describe("burstAfterProbeFailures", () => {
+  it("opens burst only after three downs in a row", () => {
+    assert.equal(burstAfterProbeFailures([]), false)
+    assert.equal(burstAfterProbeFailures(["down"]), false)
+    assert.equal(burstAfterProbeFailures(["down", "down"]), false)
+    assert.equal(burstAfterProbeFailures(["down", "down", "down"]), true)
+    assert.equal(burstAfterProbeFailures(["ready", "down", "down", "down"]), true)
+    assert.equal(burstAfterProbeFailures(["down", "down", "down", "ready"]), false)
+    assert.equal(burstAfterProbeFailures(["down", "down", "busy"]), false)
+  })
+})
+
 describe("burstStillWaiting", () => {
   it("waits only while a burst machine is still loading inside the deadline", () => {
     assert.equal(burstStillWaiting("loading", "starting", 10 * 60 * 1000), true)
@@ -130,6 +144,15 @@ describe("instance policy", () => {
     assert.equal(shouldDestroy("offline", 0), true)
     assert.equal(shouldDestroy("rebooting", 11 * 60 * 1000), true)
     assert.equal(shouldDestroy("running", 50 * 60 * 1000), false)
+  })
+
+  it("blacklists a machine that never became healthy once the load deadline passed", () => {
+    assert.equal(blacklistFailedLoad("running", "down", 41 * 60 * 1000, false, "running"), true)
+    assert.equal(blacklistFailedLoad("running", "down", 10 * 60 * 1000, false, "running"), false)
+    assert.equal(blacklistFailedLoad("running", "down", 41 * 60 * 1000, true, "running"), false)
+    assert.equal(blacklistFailedLoad("running", "ready", 41 * 60 * 1000, false, "running"), false)
+    assert.equal(blacklistFailedLoad("exited", "down", 50 * 60 * 1000, false, "stopped"), true)
+    assert.equal(blacklistFailedLoad("exited", "ready", 50 * 60 * 1000, true, "stopped"), false)
   })
 })
 

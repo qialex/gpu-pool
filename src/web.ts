@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { timingSafeEqual } from "node:crypto"
 import { clearSessionCookie, ensureOperator, login, logout, operatorIdFromRequest, sessionCookie } from "./auth.js"
 import { resolveToken, port, vastApiKey } from "./config.js"
-import { listBlacklist, listInstances, listTemplates, saveTemplateSettings, unbanMachine } from "./db.js"
+import { listBlacklist, listInstanceEvents, listInstances, listMachineEvents, listTemplates, recordInstanceEvent, saveTemplateSettings, unbanMachine } from "./db.js"
 import { upstashUsage } from "./upstash-usage.js"
 import { optionalNumber, parseCriteria, parseOptimize, renderApp, renderLogin, snapshotParts, usageText } from "./operator/page.js"
 import { isTag } from "./policy.js"
@@ -112,9 +112,54 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return
   }
 
+  const logMatch = /^\/api\/instances\/(\d+)\/log$/.exec(url.pathname)
+  if (req.method === "GET" && logMatch) {
+    const vastInstanceId = Number(logMatch[1])
+    const instance = (await listInstances()).find(row => row.vastInstanceId === vastInstanceId)
+    if (!instance) {
+      send(res, 404, "application/json", JSON.stringify({ error: "instance not found" }))
+      return
+    }
+    const events = await listInstanceEvents(instance.vastInstanceId, instance.machineId)
+    send(res, 200, "application/json", JSON.stringify({
+      vastInstanceId: instance.vastInstanceId,
+      machineId: instance.machineId,
+      probes: instance.probes,
+      events,
+    }))
+    return
+  }
+
+  const machineLogMatch = /^\/api\/machines\/(\d+)\/log$/.exec(url.pathname)
+  if (req.method === "GET" && machineLogMatch) {
+    const machineId = Number(machineLogMatch[1])
+    const instance = (await listInstances()).find(row => row.machineId === machineId) ?? null
+    const events = await listMachineEvents(machineId)
+    send(res, 200, "application/json", JSON.stringify({
+      vastInstanceId: instance?.vastInstanceId ?? null,
+      machineId,
+      probes: instance?.probes ?? [],
+      events,
+    }))
+    return
+  }
+
   const unbanMatch = /^\/blacklist\/(\d+)\/unban$/.exec(url.pathname)
   if (req.method === "POST" && unbanMatch) {
-    await unbanMachine(Number(unbanMatch[1]))
+    const machineId = Number(unbanMatch[1])
+    await unbanMachine(machineId)
+    try {
+      await recordInstanceEvent({
+        action: "unban",
+        vastInstanceId: null,
+        machineId,
+        templateHashId: null,
+        templateName: null,
+        reason: "operator unban",
+      })
+    } catch (err) {
+      console.error("[web] record unban failed", err)
+    }
     redirect(res, `/?unbanned=${unbanMatch[1]}`)
     return
   }

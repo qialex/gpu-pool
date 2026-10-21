@@ -45,6 +45,24 @@ export type InstanceRow = {
   lastVastSyncAt: Date | null
   lastProbeAt: Date | null
   readyAt: Date | null
+  probes: ProbeSample[]
+}
+
+export type ProbeSample = {
+  at: string
+  status: ProbeStatus
+}
+
+export type InstanceAction = "rent" | "release" | "ban" | "unban"
+
+export type InstanceEvent = {
+  at: string
+  action: InstanceAction
+  vastInstanceId: number | null
+  machineId: number | null
+  templateHashId: string | null
+  templateName: string | null
+  reason: string
 }
 
 export type TemplatePatch = {
@@ -87,11 +105,12 @@ export type BlacklistRow = {
   updatedAt: Date
 }
 
-type InstanceDoc = Omit<InstanceRow, "firstSeenAt" | "lastVastSyncAt" | "lastProbeAt" | "readyAt"> & {
+type InstanceDoc = Omit<InstanceRow, "firstSeenAt" | "lastVastSyncAt" | "lastProbeAt" | "readyAt" | "probes"> & {
   firstSeenAt: string
   lastVastSyncAt: string | null
   lastProbeAt: string | null
   readyAt: string | null
+  probes?: ProbeSample[]
 }
 
 type PendingDoc = { offerId: number; templateHashId: string; createdAt: string }
@@ -103,7 +122,11 @@ const KEYS = {
   instances: "doc:instances",
   pending: "doc:pending",
   blacklist: "doc:blacklist",
+  events: "doc:events",
 }
+
+const EVENT_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const PROBE_HISTORY = 3
 
 export async function listTemplates(): Promise<TemplateRow[]> {
   const rows = await readDoc<TemplateRow[]>(KEYS.templates, [])
@@ -178,7 +201,7 @@ export async function listInstancesForTag(tag: Tag): Promise<InstanceRow[]> {
   return (await listInstances()).filter(row => row.templateHashId != null && active.has(row.templateHashId))
 }
 
-export async function upsertInstance(row: Omit<InstanceRow, "firstSeenAt" | "lastVastSyncAt" | "lastProbeAt" | "readyAt" | "probeStatus"> & { probeStatus?: ProbeStatus | null }): Promise<void> {
+export async function upsertInstance(row: Omit<InstanceRow, "firstSeenAt" | "lastVastSyncAt" | "lastProbeAt" | "readyAt" | "probeStatus" | "probes"> & { probeStatus?: ProbeStatus | null }): Promise<void> {
   const now = new Date().toISOString()
   await updateDoc<InstanceDoc[]>(KEYS.instances, [], docs => {
     const current = docs.find(doc => doc.vastInstanceId === row.vastInstanceId)
@@ -193,6 +216,7 @@ export async function upsertInstance(row: Omit<InstanceRow, "firstSeenAt" | "las
           lastVastSyncAt: now,
           lastProbeAt: current.lastProbeAt,
           readyAt: current.readyAt ?? null,
+          probes: current.probes ?? [],
         }
       : {
           ...row,
@@ -202,6 +226,7 @@ export async function upsertInstance(row: Omit<InstanceRow, "firstSeenAt" | "las
           lastVastSyncAt: now,
           lastProbeAt: null,
           readyAt: null,
+          probes: [],
         }
     return [...docs.filter(doc => doc.vastInstanceId !== row.vastInstanceId), next]
   })
@@ -220,11 +245,13 @@ export async function setProbe(
   await updateDoc<InstanceDoc[]>(KEYS.instances, [], docs =>
     docs.map(doc => {
       if (doc.vastInstanceId !== vastInstanceId) return doc
+      const probes = [...(doc.probes ?? []), { at: now, status }].slice(-PROBE_HISTORY)
       return {
         ...doc,
         probeStatus: status,
         lastProbeAt: now,
         readyAt: doc.readyAt ?? (isServing(status) ? now : null),
+        probes,
         ...(endpoint ?? {}),
       }
     }),
@@ -302,6 +329,31 @@ export async function unbanMachine(machineId: number): Promise<void> {
   await updateDoc<BlacklistDoc[]>(KEYS.blacklist, [], docs => docs.filter(doc => doc.machineId !== machineId))
 }
 
+export async function recordInstanceEvent(event: Omit<InstanceEvent, "at">, now = new Date()): Promise<void> {
+  const cutoff = now.getTime() - EVENT_TTL_MS
+  await updateDoc<InstanceEvent[]>(KEYS.events, [], docs => [
+    ...docs.filter(doc => Date.parse(doc.at) > cutoff),
+    { ...event, at: now.toISOString() },
+  ])
+}
+
+export async function listInstanceEvents(vastInstanceId: number, machineId: number | null, now = new Date()): Promise<InstanceEvent[]> {
+  const cutoff = now.getTime() - EVENT_TTL_MS
+  const docs = await readDoc<InstanceEvent[]>(KEYS.events, [])
+  return docs
+    .filter(doc => Date.parse(doc.at) > cutoff)
+    .filter(doc => doc.vastInstanceId === vastInstanceId || (machineId != null && doc.machineId === machineId))
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+}
+
+export async function listMachineEvents(machineId: number, now = new Date()): Promise<InstanceEvent[]> {
+  const cutoff = now.getTime() - EVENT_TTL_MS
+  const docs = await readDoc<InstanceEvent[]>(KEYS.events, [])
+  return docs
+    .filter(doc => Date.parse(doc.at) > cutoff && doc.machineId === machineId)
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+}
+
 export async function listBlacklist(): Promise<BlacklistRow[]> {
   const docs = await readDoc<BlacklistDoc[]>(KEYS.blacklist, [])
   return docs
@@ -341,5 +393,6 @@ function hydrateInstance(doc: InstanceDoc): InstanceRow {
     lastVastSyncAt: doc.lastVastSyncAt ? new Date(doc.lastVastSyncAt) : null,
     lastProbeAt: doc.lastProbeAt ? new Date(doc.lastProbeAt) : null,
     readyAt: doc.readyAt ? new Date(doc.readyAt) : null,
+    probes: Array.isArray(doc.probes) ? doc.probes.slice(-PROBE_HISTORY) : [],
   }
 }

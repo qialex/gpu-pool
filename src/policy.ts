@@ -196,6 +196,21 @@ export function isServing(probeStatus: ProbeStatus | null): boolean {
   return probeStatus === "ready" || probeStatus === "busy"
 }
 
+/** How many of the newest probes are down, stopping at the first other result. */
+export function consecutiveDownProbes(statuses: ProbeStatus[]): number {
+  let count = 0
+  for (let i = statuses.length - 1; i >= 0; i--) {
+    if (statuses[i] !== "down") break
+    count++
+  }
+  return count
+}
+
+/** Burst may add machines only after three health checks fail in a row. */
+export function burstAfterProbeFailures(statuses: ProbeStatus[]): boolean {
+  return consecutiveDownProbes(statuses) >= 3
+}
+
 /** A burst machine that is neither loaded, gone, nor past the load deadline. */
 export function burstStillWaiting(actualStatus: string | null, probeStatus: ProbeStatus | null, ageMs: number): boolean {
   if (isServing(probeStatus) || !occupiesSlot(actualStatus)) return false
@@ -250,6 +265,23 @@ export function shouldDestroy(actualStatus: string | null, ageMs: number, intend
   }
   if (actualStatus === "rebooting" && ageMs > REBOOT_DEADLINE_MS) return true
   return false
+}
+
+/**
+ * A machine that never became healthy. Releasing it has to blacklist the host,
+ * including a burst extra we already stopped after the load deadline.
+ * A machine that did become healthy and was then stopped stays off this path.
+ */
+export function blacklistFailedLoad(
+  actualStatus: string | null,
+  probeStatus: ProbeStatus | null,
+  ageMs: number,
+  hasBeenReady: boolean,
+  intendedStatus: string | null,
+): boolean {
+  if (hasBeenReady || isServing(probeStatus)) return false
+  if (intendedStatus === "stopped") return true
+  return occupiesSlot(actualStatus) && ageMs > LOADING_DEADLINE_MS
 }
 
 export function urlSuffix(tag: Tag | null): string {

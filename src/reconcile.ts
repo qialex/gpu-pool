@@ -5,6 +5,7 @@ import {
   blacklistMachine,
   countPending,
   deleteInstance,
+  recordInstanceEvent,
   deleteInstancesExcept,
   deletePendingExcept,
   listInstances,
@@ -13,6 +14,7 @@ import {
   sweepPending,
   upsertInstance,
   upsertTemplateSeen,
+  type InstanceAction,
   type InstanceRow,
   type TemplateRow,
 } from "./db.js"
@@ -21,6 +23,8 @@ import {
   buildSearchBody,
   detectContainerPort,
   bestProbe,
+  blacklistFailedLoad,
+  burstAfterProbeFailures,
   burstStillWaiting,
   hostPortFor,
   instanceRoot,
@@ -134,22 +138,34 @@ async function destroyStuck(apiKey: string, instances: InstanceRow[], templates:
   const now = Date.now()
   const byHash = new Map(templates.map(template => [template.hashId, template]))
   for (const instance of instances) {
-    if (instance.intendedStatus === "stopped") {
+    const age = ageMs(instance, now)
+    const failedLoad = blacklistFailedLoad(
+      instance.actualStatus,
+      instance.probeStatus,
+      age,
+      instance.readyAt != null,
+      instance.intendedStatus,
+    )
+    if (instance.intendedStatus === "stopped" && !failedLoad) {
       try {
         await destroyInstance(apiKey, instance.vastInstanceId)
         await deleteInstance(instance.vastInstanceId)
         log(`removed stopped ${instance.vastInstanceId} without blacklist`)
+        await note(instance, byHash, "release", "removed stopped contract")
       } catch (err) {
         console.error(`[worker] remove stopped ${instance.vastInstanceId} failed`, err)
       }
       continue
     }
-    if (!shouldDestroy(instance.actualStatus, ageMs(instance, now), instance.intendedStatus)) continue
+    if (!failedLoad && !shouldDestroy(instance.actualStatus, age, instance.intendedStatus)) continue
     try {
       await destroyInstance(apiKey, instance.vastInstanceId)
       await deleteInstance(instance.vastInstanceId)
-      const reason = instance.actualStatus ?? "provisioning"
+      const reason = failedLoad && !shouldDestroy(instance.actualStatus, age, instance.intendedStatus)
+        ? "unhealthy"
+        : instance.actualStatus ?? "provisioning"
       log(`destroyed ${instance.vastInstanceId} (${reason})`)
+      await note(instance, byHash, "release", `destroyed (${reason})`)
       if (instance.machineId == null) {
         log(`instance ${instance.vastInstanceId} had no machine id, so it was not blacklisted`)
       } else {
@@ -164,6 +180,7 @@ async function destroyStuck(apiKey: string, instances: InstanceRow[], templates:
             metrics: instance.metrics,
           })
           log(`blacklisted machine ${instance.machineId} for ${ban.strikes} week(s), until ${ban.bannedUntil.toISOString()}`)
+          await note(instance, byHash, "ban", `${reason}, ${ban.strikes} week ban until ${ban.bannedUntil.toISOString()}`)
         } catch (err) {
           console.error(`[worker] blacklist machine ${instance.machineId} failed`, err)
         }
@@ -214,6 +231,7 @@ async function stopExtras(apiKey: string, templates: TemplateRow[], instances: I
         try {
           await stopInstance(apiKey, instance.vastInstanceId)
           log(`stopped burst extra ${instance.vastInstanceId}`)
+          await note(instance, new Map([[template.hashId, template]]), "release", "stopped burst extra")
         } catch (err) {
           console.error(`[worker] stop ${instance.vastInstanceId} failed`, err)
         }
@@ -233,6 +251,7 @@ async function stopExtras(apiKey: string, templates: TemplateRow[], instances: I
       try {
         await stopInstance(apiKey, instance.vastInstanceId)
         log(`stopped extra ${instance.vastInstanceId}`)
+        await note(instance, new Map([[template.hashId, template]]), "release", "stopped extra")
       } catch (err) {
         console.error(`[worker] stop ${instance.vastInstanceId} failed`, err)
       }
@@ -258,19 +277,20 @@ async function rentShortfalls(apiKey: string, templates: TemplateRow[], instance
     const banned = await activeBlacklistedMachineIds()
     const named = template.name ?? template.hashId
     const ready = mine.filter(instance => occupiesSlot(instance.actualStatus) && isServing(instance.probeStatus)).length
+    const probeFailed = mine.some(instance => occupiesSlot(instance.actualStatus) && burstAfterProbeFailures(instance.probes.map(probe => probe.status)))
     const burstCap = Math.max(template.desiredCount, template.burst)
     const now = Date.now()
     const burstWaiting = template.burst > template.desiredCount && (
       occupying > template.desiredCount
       || mine.some(instance => burstStillWaiting(instance.actualStatus, instance.probeStatus, ageMs(instance, now)))
     )
-    if (template.burst > 0 && ready < template.desiredCount && occupying < burstCap) {
+    if (template.burst > 0 && probeFailed && ready < template.desiredCount && occupying < burstCap) {
       const plan = priceSearchPlan(search)
       if (plan.length === 0) continue
       const taken = new Set<number>()
       let rented = false
       for (let n = occupying; n < burstCap; n++) {
-        const hit = await rentFirstOffer(apiKey, template, plan, banned, null, taken)
+        const hit = await rentFirstOffer(apiKey, template, plan, banned, null, taken, "burst after 3 failed probes")
         if (!hit) break
         rented = true
       }
@@ -278,11 +298,11 @@ async function rentShortfalls(apiKey: string, templates: TemplateRow[], instance
       continue
     }
     if (burstWaiting) continue
-    if (ready < template.desiredCount && template.burst > 0) continue
+    if (template.burst > 0 && ready < template.desiredCount && occupying >= burstCap) continue
     if (occupying < template.desiredCount) {
       const plan = priceSearchPlan(search)
       if (plan.length === 0) continue
-      const rented = await rentFirstOffer(apiKey, template, plan, banned, null)
+      const rented = await rentFirstOffer(apiKey, template, plan, banned, null, new Set(), "below desired count")
       if (!rented) log(`left ${named} short`)
       continue
     }
@@ -293,7 +313,7 @@ async function rentShortfalls(apiKey: string, templates: TemplateRow[], instance
     const plan = optimizationPlan(search, worst.metrics, template.optimize)
     if (plan.length === 0) continue
     log(`optimizing ${named} against instance ${worst.vastInstanceId}`)
-    const rented = await rentFirstOffer(apiKey, template, plan, banned, worst.metrics)
+    const rented = await rentFirstOffer(apiKey, template, plan, banned, worst.metrics, new Set(), `optimize against ${worst.vastInstanceId}`)
     if (!rented) log(`no better offer for ${named}`)
   }
 }
@@ -305,6 +325,7 @@ async function rentFirstOffer(
   banned: Set<number>,
   incumbent: MetricMap | null,
   taken: Set<number> = new Set(),
+  reason = "rent",
 ): Promise<boolean> {
   const named = template.name ?? template.hashId
   let attempt = 0
@@ -352,6 +373,12 @@ async function rentFirstOffer(
         const machine = offerMachineId(offer)
         if (machine != null) banned.add(machine)
         log(`rented offer ${id} for ${named} at <= $${ceiling}`)
+        await note(
+          { vastInstanceId: contractId, machineId: machine, templateHashId: template.hashId },
+          new Map([[template.hashId, template]]),
+          "rent",
+          `${reason}, offer ${id} at <= $${ceiling}`,
+        )
         return true
       } catch (err) {
         taken.add(id)
@@ -381,6 +408,27 @@ function endpointFor(instance: VastInstance, template: TemplateRow | null): { ip
     ip: instance.publicIp,
     port,
     baseUrl: instanceRoot(instance.publicIp, port),
+  }
+}
+
+async function note(
+  instance: { vastInstanceId: number | null; machineId: number | null; templateHashId: string | null },
+  byHash: Map<string, TemplateRow>,
+  action: InstanceAction,
+  reason: string,
+): Promise<void> {
+  const template = instance.templateHashId ? byHash.get(instance.templateHashId) : undefined
+  try {
+    await recordInstanceEvent({
+      action,
+      vastInstanceId: instance.vastInstanceId,
+      machineId: instance.machineId,
+      templateHashId: instance.templateHashId,
+      templateName: template?.name ?? null,
+      reason,
+    })
+  } catch (err) {
+    console.error(`[worker] record ${action} failed`, err)
   }
 }
 

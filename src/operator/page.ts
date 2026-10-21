@@ -45,6 +45,13 @@ export function renderApp(
     <section id="templates">${parts.templates}</section>
     <section id="rented">${parts.rented}</section>
     <section id="blacklist">${parts.blacklist}</section>
+    <dialog id="logs">
+      <div class="title">
+        <h2 id="logs-title">Logs</h2>
+        <form method="dialog"><button type="submit" class="ghost">Close</button></form>
+      </div>
+      <div id="logs-body"><p class="muted">Loading…</p></div>
+    </dialog>
   `, liveChecksScript())
 }
 
@@ -104,6 +111,35 @@ function liveChecksScript(): string {
       document.getElementById("blacklist").innerHTML = body.blacklist
       vast.textContent = "Vast is up to date."
     }).catch(() => { vast.textContent = "Vast check failed." })
+    document.addEventListener("click", (event) => {
+      const target = event.target
+      const button = target && target.closest ? target.closest("[data-logs]") : null
+      if (!button) return
+      const path = button.getAttribute("data-logs")
+      const dialog = document.getElementById("logs")
+      const title = document.getElementById("logs-title")
+      const body = document.getElementById("logs-body")
+      title.textContent = "Logs"
+      body.innerHTML = "<p class=\\"muted\\">Loading…</p>"
+      if (!dialog.open) dialog.showModal()
+      fetch(path).then(response => response.json()).then(data => {
+        if (data.error) { body.textContent = data.error; return }
+        const machine = data.machineId == null ? "" : "machine " + data.machineId
+        title.textContent = data.vastInstanceId == null ? machine : "Instance " + data.vastInstanceId + (machine ? " · " + machine : "")
+        const probes = Array.isArray(data.probes) ? data.probes.slice().reverse() : []
+        const events = Array.isArray(data.events) ? data.events : []
+        const probeRows = probes.length === 0
+          ? "<li class=\\"muted\\">No probes yet.</li>"
+          : probes.map(probe => "<li><time>" + esc(probe.at) + "</time> " + esc(probe.status) + "</li>").join("")
+        const eventRows = events.length === 0
+          ? "<li class=\\"muted\\">No rent, release, or ban events in the last 7 days.</li>"
+          : events.map(item => "<li><time>" + esc(item.at) + "</time> <strong>" + esc(item.action) + "</strong> " + esc(item.reason) + (item.vastInstanceId ? " · instance " + esc(item.vastInstanceId) : "") + "</li>").join("")
+        body.innerHTML = "<h3>Last probes</h3><ul class=\\"log-list\\">" + probeRows + "</ul><h3>Last 7 days</h3><ul class=\\"log-list\\">" + eventRows + "</ul>"
+      }).catch(() => { body.textContent = "Could not load logs." })
+    })
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\\"": "&quot;" }[ch]))
+    }
   </script>`
 }
 
@@ -170,6 +206,7 @@ function rentedTable(instances: InstanceRow[], byHash: Map<string, TemplateRow>)
     const template = instance.templateHashId ? byHash.get(instance.templateHashId) : undefined
     const age = instance.startDate != null ? now - instance.startDate * 1000 : now - instance.firstSeenAt.getTime()
     return `<tr>
+      <td><button type="button" class="icon" data-logs="/api/instances/${instance.vastInstanceId}/log" aria-label="Logs for instance ${instance.vastInstanceId}">${logIcon()}</button></td>
       <td>${instance.vastInstanceId}</td>
       <td>${esc(instance.machineId ?? "—")}</td>
       <td>${esc(template?.name ?? instance.templateHashId ?? "—")}</td>
@@ -192,7 +229,7 @@ function rentedTable(instances: InstanceRow[], byHash: Map<string, TemplateRow>)
   }).join("")
   return `<div class="table-wrap"><table>
     <thead><tr>
-      <th>Id</th><th>Machine</th><th>Template</th><th>Tag</th><th>GPU</th><th>$/hr</th><th>$/mo</th>
+      <th></th><th>Id</th><th>Machine</th><th>Template</th><th>Tag</th><th>GPU</th><th>$/hr</th><th>$/mo</th>
       <th>VRAM</th><th>GPU frac</th><th>Mem GB/s</th><th>BW×frac/$</th><th>Endpoint</th>
       <th>Vast</th><th>Intended</th><th>Probe</th><th>Age</th><th>Last probe</th><th>Message</th>
     </tr></thead>
@@ -205,6 +242,7 @@ function blacklistTable(rows: BlacklistRow[]): string {
   const body = rows.map(row => {
     const active = row.bannedUntil.getTime() > now
     return `<tr>
+      <td><button type="button" class="icon" data-logs="/api/machines/${row.machineId}/log" aria-label="Logs for machine ${row.machineId}">${logIcon()}</button></td>
       <td>${row.machineId}</td>
       <td>${esc(row.templateName ?? row.templateHashId ?? "—")}</td>
       <td>${esc(row.tags.length > 0 ? row.tags.join(", ") : "—")}</td>
@@ -228,7 +266,7 @@ function blacklistTable(rows: BlacklistRow[]): string {
   }).join("")
   return `<div class="table-wrap"><table>
     <thead><tr>
-      <th>Machine</th><th>Template</th><th>Tag</th><th>GPU</th><th>$/hr</th><th>$/mo</th>
+      <th></th><th>Machine</th><th>Template</th><th>Tag</th><th>GPU</th><th>$/hr</th><th>$/mo</th>
       <th>VRAM</th><th>GPU frac</th><th>Mem GB/s</th><th>BW×frac/$</th>
       <th>Failures</th><th>Status</th><th>Until</th><th>Last reason</th><th></th>
     </tr></thead>
@@ -255,7 +293,7 @@ function optimizeFields(goals: OptimizeGoal[]): string {
   }).join("")
   return `<div class="optimize">
     <span>Optimize</span>
-    <p class="hint">First row that clears its gain wins. Blank gain means any improvement. Leave all rows on none to only fill missing instances. Leave optimize trials empty to keep it off. Instances is how many must be healthy. Burst is how many may load at once while that healthy count is short.</p>
+    <p class="hint">First row that clears its gain wins. Blank gain means any improvement. Leave all rows on none to only fill missing instances. Leave optimize trials empty to keep it off. Instances is how many must be healthy. Burst rents extra machines only after three probes in a row fail.</p>
     ${rows}
   </div>`
 }
@@ -294,6 +332,14 @@ function vram(mb: number | null | undefined): string {
 function metric(value: number | null | undefined, digits: number): string {
   if (value == null) return "—"
   return value.toFixed(digits)
+}
+
+function logIcon(): string {
+  return `<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4">
+    <path d="M3 2.5h7.2L13 5.2V13.5H3z"/>
+    <path d="M10 2.6V5.4H13"/>
+    <path d="M5.2 7.2h5.6M5.2 9.4h5.6M5.2 11.6h3.4"/>
+  </svg>`
 }
 
 function formatAge(ms: number): string {
@@ -346,6 +392,14 @@ function layout(title: string, body: string, script = ""): string {
     th { color: var(--muted); font-weight: 600; }
     td form { margin: 0; }
     td button { padding: 4px 8px; }
+    button.icon { background: transparent; color: var(--ink); border: 1px solid var(--line); padding: 3px 6px; line-height: 0; }
+    button.icon svg { display: block; }
+    dialog { border: 1px solid var(--line); background: var(--card); color: var(--ink); padding: 16px 18px 20px; max-width: 680px; width: calc(100% - 32px); }
+    dialog::backdrop { background: rgba(28, 25, 21, 0.45); }
+    dialog h3 { margin: 16px 0 4px; font-size: 14px; }
+    .log-list { list-style: none; padding: 0; margin: 0; }
+    .log-list li { padding: 7px 0; border-bottom: 1px solid var(--line); white-space: normal; }
+    .log-list time { color: var(--muted); font-size: 12px; margin-right: 8px; }
   </style>
 </head>
 <body><main>${body}</main>${script}</body>
