@@ -85,6 +85,25 @@ export function isTag(value: string | null | undefined): value is Tag {
   return TAGS.includes(value as Tag)
 }
 
+export function isTextTag(tag: Tag): boolean {
+  return tag === "text_regular" || tag === "text_premium"
+}
+
+const SPEED_INTERVAL_MS = 60 * 60 * 1000
+
+/** True when a text instance has never been timed, or the last attempt is at least an hour old. */
+export function textSpeedDue(lastAttemptMs: number | null, nowMs: number): boolean {
+  if (lastAttemptMs == null || !Number.isFinite(lastAttemptMs)) return true
+  return nowMs - lastAttemptMs >= SPEED_INTERVAL_MS
+}
+
+/** Completion tokens divided by the full request time. Missing or empty timings are not a sample. */
+export function tokensPerSecond(completionTokens: number, elapsedMs: number): number | null {
+  if (!Number.isFinite(completionTokens) || completionTokens < 0) return null
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return null
+  return completionTokens / (elapsedMs / 1000)
+}
+
 export function isOptimizeField(value: string | null | undefined): value is OptimizeField {
   return (OPTIMIZE_FIELDS as readonly string[]).includes(value ?? "")
 }
@@ -196,24 +215,31 @@ export function isServing(probeStatus: ProbeStatus | null): boolean {
   return probeStatus === "ready" || probeStatus === "busy"
 }
 
-/** How many of the newest probes are down, stopping at the first other result. */
-export function consecutiveDownProbes(statuses: ProbeStatus[]): number {
-  let count = 0
-  for (let i = statuses.length - 1; i >= 0; i--) {
-    if (statuses[i] !== "down") break
-    count++
-  }
-  return count
+/** Counts toward Instances only after the first successful probe. A later outage still counts. */
+export function countsAsWorking(readyAt: Date | null): boolean {
+  return readyAt != null
 }
 
-/** Burst may add machines only after three health checks fail in a row. */
-export function burstAfterProbeFailures(statuses: ProbeStatus[]): boolean {
-  return consecutiveDownProbes(statuses) >= 3
+/**
+ * How many more machines to rent while proven machines are still short of Instances.
+ * Null means burst does not apply. Zero means the burst slots are full and the caller should wait.
+ * An unproven machine occupies one of these slots and does not count as working.
+ */
+export function burstRentCount(working: number, desired: number, burst: number, occupying: number): number | null {
+  if (burst <= desired || working >= desired) return null
+  const cap = Math.max(desired, burst)
+  if (occupying >= cap) return 0
+  return cap - occupying
 }
 
-/** A burst machine that is neither loaded, gone, nor past the load deadline. */
-export function burstStillWaiting(actualStatus: string | null, probeStatus: ProbeStatus | null, ageMs: number): boolean {
-  if (isServing(probeStatus) || !occupiesSlot(actualStatus)) return false
+/** An unproven machine that is neither loaded, gone, nor past the load deadline. */
+export function burstStillWaiting(
+  actualStatus: string | null,
+  probeStatus: ProbeStatus | null,
+  ageMs: number,
+  hasWorked = false,
+): boolean {
+  if (hasWorked || isServing(probeStatus) || !occupiesSlot(actualStatus)) return false
   return ageMs <= LOADING_DEADLINE_MS
 }
 

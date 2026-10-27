@@ -10,14 +10,18 @@ import {
   detectContainerPort,
   hostPortFor,
   blacklistFailedLoad,
-  burstAfterProbeFailures,
+  burstRentCount,
   burstStillWaiting,
+  countsAsWorking,
   isServing,
   occupiesSlot,
   priceCeilings,
   priceSearchPlan,
   probePaths,
   shouldDestroy,
+  isTextTag,
+  textSpeedDue,
+  tokensPerSecond,
 } from "./policy.ts"
 
 describe("priceCeilings", () => {
@@ -105,26 +109,40 @@ describe("isServing", () => {
   })
 })
 
-describe("burstAfterProbeFailures", () => {
-  it("opens burst only after three downs in a row", () => {
-    assert.equal(burstAfterProbeFailures([]), false)
-    assert.equal(burstAfterProbeFailures(["down"]), false)
-    assert.equal(burstAfterProbeFailures(["down", "down"]), false)
-    assert.equal(burstAfterProbeFailures(["down", "down", "down"]), true)
-    assert.equal(burstAfterProbeFailures(["ready", "down", "down", "down"]), true)
-    assert.equal(burstAfterProbeFailures(["down", "down", "down", "ready"]), false)
-    assert.equal(burstAfterProbeFailures(["down", "down", "busy"]), false)
+describe("countsAsWorking", () => {
+  it("counts a machine only after it has come ready, including through a later outage", () => {
+    assert.equal(countsAsWorking(null), false)
+    assert.equal(countsAsWorking(new Date()), true)
+  })
+})
+
+describe("burstRentCount", () => {
+  it("rents the burst set while no machine has come ready", () => {
+    assert.equal(burstRentCount(0, 1, 3, 0), 3)
+    assert.equal(burstRentCount(0, 1, 3, 1), 2)
+    assert.equal(burstRentCount(0, 1, 3, 3), 0)
+  })
+
+  it("leaves a machine that already worked on the normal path", () => {
+    assert.equal(burstRentCount(1, 1, 3, 1), null)
+    assert.equal(burstRentCount(1, 1, 3, 2), null)
+  })
+
+  it("stays off when burst is not above the desired count", () => {
+    assert.equal(burstRentCount(0, 1, 0, 0), null)
+    assert.equal(burstRentCount(0, 1, 1, 0), null)
   })
 })
 
 describe("burstStillWaiting", () => {
-  it("waits only while a burst machine is still loading inside the deadline", () => {
+  it("waits only while an unproven machine is still loading inside the deadline", () => {
     assert.equal(burstStillWaiting("loading", "starting", 10 * 60 * 1000), true)
     assert.equal(burstStillWaiting("running", "down", 10 * 60 * 1000), true)
     assert.equal(burstStillWaiting("running", "ready", 10 * 60 * 1000), false)
     assert.equal(burstStillWaiting("running", "busy", 10 * 60 * 1000), false)
     assert.equal(burstStillWaiting("loading", "starting", 41 * 60 * 1000), false)
     assert.equal(burstStillWaiting("exited", null, 1000), false)
+    assert.equal(burstStillWaiting("running", "down", 10 * 60 * 1000, true), false)
   })
 })
 
@@ -179,6 +197,38 @@ describe("search body", () => {
     assert.deepEqual(body.disk_space, { gte: 40 })
     assert.deepEqual(body.gpu_name, { eq: "RTX_4090" })
     assert.deepEqual(body.verification, { eq: "verified" })
+  })
+})
+
+describe("isTextTag", () => {
+  it("is only the text pools", () => {
+    assert.equal(isTextTag("text_regular"), true)
+    assert.equal(isTextTag("text_premium"), true)
+    assert.equal(isTextTag("audio"), false)
+    assert.equal(isTextTag("image"), false)
+  })
+})
+
+describe("textSpeedDue", () => {
+  const hour = 60 * 60 * 1000
+
+  it("is due when there has been no attempt", () => {
+    assert.equal(textSpeedDue(null, 1_000), true)
+  })
+
+  it("waits an hour after the last attempt", () => {
+    const now = 10 * hour
+    assert.equal(textSpeedDue(now - hour + 1, now), false)
+    assert.equal(textSpeedDue(now - hour, now), true)
+  })
+})
+
+describe("tokensPerSecond", () => {
+  it("divides completion tokens by the full request time", () => {
+    assert.equal(tokensPerSecond(32, 500), 64)
+    assert.equal(tokensPerSecond(0, 500), 0)
+    assert.equal(tokensPerSecond(-1, 500), null)
+    assert.equal(tokensPerSecond(32, 0), null)
   })
 })
 

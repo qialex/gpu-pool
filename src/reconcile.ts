@@ -11,6 +11,7 @@ import {
   listInstances,
   listTemplates,
   setProbe,
+  setSpeed,
   sweepPending,
   upsertInstance,
   upsertTemplateSeen,
@@ -19,18 +20,21 @@ import {
   type TemplateRow,
 } from "./db.js"
 import { probeUrl } from "./probe.js"
+import { measureTextSpeed } from "./speed.js"
 import {
   buildSearchBody,
   detectContainerPort,
   bestProbe,
   blacklistFailedLoad,
-  burstAfterProbeFailures,
+  burstRentCount,
   burstStillWaiting,
+  countsAsWorking,
   hostPortFor,
   instanceRoot,
   compareMetrics,
   isBetter,
   isServing,
+  isTextTag,
   metricsFrom,
   occupiesSlot,
   optimizationPlan,
@@ -39,6 +43,7 @@ import {
   shouldDestroy,
   stillStarting,
   stopRank,
+  textSpeedDue,
   type MetricMap,
   type OptimizeGoal,
   type ProbeStatus,
@@ -71,6 +76,7 @@ export async function reconcile(): Promise<void> {
   const fresh = await listInstances()
   await pingRunning(fresh, templates)
   const afterPing = await listInstances()
+  await measureReadyText(afterPing, templates)
   await stopExtras(apiKey, templates, afterPing)
   await rentShortfalls(apiKey, templates, afterPing)
 }
@@ -208,6 +214,45 @@ async function pingRunning(instances: InstanceRow[], templates: TemplateRow[]): 
   }
 }
 
+async function measureReadyText(instances: InstanceRow[], templates: TemplateRow[]): Promise<void> {
+  const byHash = new Map(templates.map(template => [template.hashId, template]))
+  const now = Date.now()
+  for (const instance of instances) {
+    if (instance.actualStatus !== "running" || instance.probeStatus !== "ready") continue
+    if (!instance.publicIp || instance.hostPort == null) continue
+    const template = instance.templateHashId ? byHash.get(instance.templateHashId) : undefined
+    if (!template?.active || !template.tags.some(isTextTag)) continue
+    if (!textSpeedDue(instance.speedAt?.getTime() ?? null, now)) continue
+    const root = instanceRoot(instance.publicIp, instance.hostPort)
+    try {
+      const result = await measureTextSpeed(root)
+      if (result.kind === "loading") {
+        log(`speed ${instance.vastInstanceId} waiting for models`)
+        continue
+      }
+      await setSpeed(instance.vastInstanceId, {
+        tokensPerSec: result.tokensPerSec,
+        model: result.model,
+        error: result.error,
+      })
+      log(result.error
+        ? `speed ${instance.vastInstanceId} failed (${result.error})`
+        : `speed ${instance.vastInstanceId} ${result.tokensPerSec?.toFixed(1)} tok/s${result.model ? ` ${result.model}` : ""}`)
+    } catch (err) {
+      console.error(`[worker] speed ${instance.vastInstanceId} failed`, err)
+      try {
+        await setSpeed(instance.vastInstanceId, {
+          tokensPerSec: null,
+          model: null,
+          error: err instanceof Error && err.message ? err.message : "speed check failed",
+        })
+      } catch (storeErr) {
+        console.error(`[worker] store speed ${instance.vastInstanceId} failed`, storeErr)
+      }
+    }
+  }
+}
+
 async function stopExtras(apiKey: string, templates: TemplateRow[], instances: InstanceRow[]): Promise<void> {
   for (const template of templates) {
     if (!template.active) continue
@@ -218,7 +263,7 @@ async function stopExtras(apiKey: string, templates: TemplateRow[], instances: I
     if (excess <= 0) continue
     const now = Date.now()
     if (template.burst > template.desiredCount) {
-      const waiting = pending > 0 || held.some(instance => burstStillWaiting(instance.actualStatus, instance.probeStatus, ageMs(instance, now)))
+      const waiting = pending > 0 || held.some(instance => burstStillWaiting(instance.actualStatus, instance.probeStatus, ageMs(instance, now), countsAsWorking(instance.readyAt)))
       if (waiting) continue
       const keep = new Set(
         held
@@ -276,29 +321,29 @@ async function rentShortfalls(apiKey: string, templates: TemplateRow[], instance
     }
     const banned = await activeBlacklistedMachineIds()
     const named = template.name ?? template.hashId
-    const ready = mine.filter(instance => occupiesSlot(instance.actualStatus) && isServing(instance.probeStatus)).length
-    const probeFailed = mine.some(instance => occupiesSlot(instance.actualStatus) && burstAfterProbeFailures(instance.probes.map(probe => probe.status)))
-    const burstCap = Math.max(template.desiredCount, template.burst)
+    const working = mine.filter(instance => occupiesSlot(instance.actualStatus) && countsAsWorking(instance.readyAt)).length
     const now = Date.now()
     const burstWaiting = template.burst > template.desiredCount && (
       occupying > template.desiredCount
-      || mine.some(instance => burstStillWaiting(instance.actualStatus, instance.probeStatus, ageMs(instance, now)))
+      || mine.some(instance => burstStillWaiting(instance.actualStatus, instance.probeStatus, ageMs(instance, now), countsAsWorking(instance.readyAt)))
     )
-    if (template.burst > 0 && probeFailed && ready < template.desiredCount && occupying < burstCap) {
-      const plan = priceSearchPlan(search)
-      if (plan.length === 0) continue
-      const taken = new Set<number>()
-      let rented = false
-      for (let n = occupying; n < burstCap; n++) {
-        const hit = await rentFirstOffer(apiKey, template, plan, banned, null, taken, "burst after 3 failed probes")
-        if (!hit) break
-        rented = true
+    const burstRent = burstRentCount(working, template.desiredCount, template.burst, occupying)
+    if (burstRent != null) {
+      if (burstRent > 0) {
+        const plan = priceSearchPlan(search)
+        if (plan.length === 0) continue
+        const taken = new Set<number>()
+        let rented = false
+        for (let n = 0; n < burstRent; n++) {
+          const hit = await rentFirstOffer(apiKey, template, plan, banned, null, taken, "burst until one comes ready")
+          if (!hit) break
+          rented = true
+        }
+        if (!rented) log(`left ${named} short of ${template.desiredCount} healthy`)
       }
-      if (!rented) log(`left ${named} short of ${template.desiredCount} healthy`)
       continue
     }
     if (burstWaiting) continue
-    if (template.burst > 0 && ready < template.desiredCount && occupying >= burstCap) continue
     if (occupying < template.desiredCount) {
       const plan = priceSearchPlan(search)
       if (plan.length === 0) continue

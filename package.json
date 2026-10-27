@@ -4,8 +4,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "web": "tsx src/web.ts",
-    "worker": "tsx src/worker.ts",
+    "web": "tsx --env-file=.env src/web.ts",
+    "worker": "tsx --env-file=.env src/worker.ts",
     "test": "node --experimental-strip-types --test src/policy.test.ts"
   },
   "devDependencies": {

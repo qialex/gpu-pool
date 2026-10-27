@@ -2,12 +2,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { timingSafeEqual } from "node:crypto"
 import { clearSessionCookie, ensureOperator, login, logout, operatorIdFromRequest, sessionCookie } from "./auth.js"
 import { resolveToken, port, vastApiKey } from "./config.js"
-import { listBlacklist, listInstanceEvents, listInstances, listMachineEvents, listTemplates, recordInstanceEvent, saveTemplateSettings, unbanMachine } from "./db.js"
+import { blacklistMachine, deleteInstance, getTemplate, listBlacklist, listInstanceEvents, listInstances, listMachineEvents, listTemplates, recordInstanceEvent, saveTemplateSettings, unbanMachine } from "./db.js"
 import { upstashUsage } from "./upstash-usage.js"
 import { optionalNumber, parseCriteria, parseOptimize, renderApp, renderLogin, snapshotParts, usageText } from "./operator/page.js"
 import { isTag } from "./policy.js"
 import { refreshSnapshot, syncTemplates } from "./reconcile.js"
 import { resolveAll, resolveTag } from "./resolve.js"
+import { destroyInstance } from "./vast.js"
 
 const server = createServer((req, res) => {
   void handle(req, res).catch(err => {
@@ -57,18 +58,30 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (req.method === "GET" && url.pathname === "/") {
     const [templates, instances, blacklist] = await Promise.all([listTemplates(), listInstances(), listBlacklist()])
     const unbanned = url.searchParams.get("unbanned")
+    const banned = url.searchParams.get("banned")
+    const ban = url.searchParams.get("ban")
     const sync = url.searchParams.get("sync")
     const notice = unbanned
       ? `Unbanned machine ${unbanned}.`
-      : sync === "ok"
-        ? "Synced templates."
-        : sync === "missing"
-          ? "VAST_API_KEY is not set."
-          : sync === "failed"
-            ? "Template sync failed."
-            : url.searchParams.get("saved")
-              ? "Saved."
-              : ""
+      : banned
+        ? `Banned machine ${banned}.`
+        : ban === "failed"
+          ? "Could not destroy the instance, so it was not banned."
+          : ban === "keep"
+            ? "Destroyed the instance, but the machine was not banned."
+            : ban === "missing"
+              ? "VAST_API_KEY is not set."
+              : ban === "unknown"
+                ? "That instance is no longer rented."
+                : sync === "ok"
+                  ? "Synced templates."
+                  : sync === "missing"
+                    ? "VAST_API_KEY is not set."
+                    : sync === "failed"
+                      ? "Template sync failed."
+                      : url.searchParams.get("saved")
+                        ? "Saved."
+                        : ""
     send(res, 200, "text/html; charset=utf-8", renderApp(templates, instances, blacklist, notice))
     return
   }
@@ -144,6 +157,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return
   }
 
+  const banMatch = /^\/instances\/(\d+)\/ban$/.exec(url.pathname)
+  if (req.method === "POST" && banMatch) {
+    await handleBan(res, Number(banMatch[1]))
+    return
+  }
+
   const unbanMatch = /^\/blacklist\/(\d+)\/unban$/.exec(url.pathname)
   if (req.method === "POST" && unbanMatch) {
     const machineId = Number(unbanMatch[1])
@@ -193,6 +212,64 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   send(res, 404, "text/plain", "Not found")
+}
+
+async function handleBan(res: ServerResponse, vastInstanceId: number): Promise<void> {
+  const instance = (await listInstances()).find(row => row.vastInstanceId === vastInstanceId)
+  if (!instance || instance.machineId == null) {
+    redirect(res, "/?ban=unknown")
+    return
+  }
+  const key = vastApiKey()
+  if (!key) {
+    redirect(res, "/?ban=missing")
+    return
+  }
+  try {
+    await destroyInstance(key, vastInstanceId)
+  } catch (err) {
+    console.error(`[web] destroy ${vastInstanceId} for ban failed`, err)
+    redirect(res, "/?ban=failed")
+    return
+  }
+  await deleteInstance(vastInstanceId)
+  const template = instance.templateHashId ? await getTemplate(instance.templateHashId) : null
+  const machineId = instance.machineId
+  try {
+    await recordInstanceEvent({
+      action: "release",
+      vastInstanceId,
+      machineId,
+      templateHashId: instance.templateHashId,
+      templateName: template?.name ?? null,
+      reason: "destroyed (operator ban)",
+    })
+  } catch (err) {
+    console.error("[web] record operator release failed", err)
+  }
+  try {
+    const ban = await blacklistMachine(machineId, "operator ban", {
+      templateHashId: instance.templateHashId,
+      templateName: template?.name ?? null,
+      tags: template?.tags ?? [],
+      gpuName: instance.gpuName,
+      dphTotal: instance.dphTotal,
+      metrics: instance.metrics,
+    })
+    await recordInstanceEvent({
+      action: "ban",
+      vastInstanceId,
+      machineId,
+      templateHashId: instance.templateHashId,
+      templateName: template?.name ?? null,
+      reason: `operator ban, ${ban.strikes} week ban until ${ban.bannedUntil.toISOString()}`,
+    })
+  } catch (err) {
+    console.error(`[web] blacklist machine ${machineId} failed`, err)
+    redirect(res, "/?ban=keep")
+    return
+  }
+  redirect(res, `/?banned=${machineId}`)
 }
 
 async function handleResolve(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {

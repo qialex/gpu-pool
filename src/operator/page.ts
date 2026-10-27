@@ -6,6 +6,7 @@ import {
   OPTIMIZE_SLOTS,
   TAGS,
   isOptimizeField,
+  isTextTag,
   type Criteria,
   type OptimizeGoal,
   type Tag,
@@ -222,16 +223,18 @@ function rentedTable(instances: InstanceRow[], byHash: Map<string, TemplateRow>)
       <td>${esc(instance.actualStatus ?? "provisioning")}</td>
       <td>${esc(instance.intendedStatus ?? "—")}</td>
       <td>${esc(instance.probeStatus ?? "—")}</td>
+      <td>${esc(speedText(instance, template))}</td>
       <td>${esc(formatAge(age))}</td>
       <td>${esc(instance.lastProbeAt ? instance.lastProbeAt.toISOString() : "—")}</td>
       <td>${esc(instance.statusMsg ?? "")}</td>
+      <td>${banButton(instance)}</td>
     </tr>`
   }).join("")
   return `<div class="table-wrap"><table>
     <thead><tr>
       <th></th><th>Id</th><th>Machine</th><th>Template</th><th>Tag</th><th>GPU</th><th>$/hr</th><th>$/mo</th>
       <th>VRAM</th><th>GPU frac</th><th>Mem GB/s</th><th>BW×frac/$</th><th>Endpoint</th>
-      <th>Vast</th><th>Intended</th><th>Probe</th><th>Age</th><th>Last probe</th><th>Message</th>
+      <th>Vast</th><th>Intended</th><th>Probe</th><th>tok/s</th><th>Age</th><th>Last probe</th><th>Message</th><th></th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`
@@ -293,7 +296,7 @@ function optimizeFields(goals: OptimizeGoal[]): string {
   }).join("")
   return `<div class="optimize">
     <span>Optimize</span>
-    <p class="hint">First row that clears its gain wins. Blank gain means any improvement. Leave all rows on none to only fill missing instances. Leave optimize trials empty to keep it off. Instances is how many must be healthy. Burst rents extra machines only after three probes in a row fail.</p>
+    <p class="hint">First row that clears its gain wins. Blank gain means any improvement. Leave all rows on none to only fill missing instances. Leave optimize trials empty to keep it off. Instances is how many must have come ready. One that already did still counts through a short outage. Burst is how many to rent while none have come ready. A machine that has never been ready only fills a burst slot, until its first ready probe.</p>
     ${rows}
   </div>`
 }
@@ -311,6 +314,21 @@ function tri(name: string, label: string, value: boolean | null | undefined): st
       <option value="no"${current === "no" ? " selected" : ""}>no</option>
     </select>
   </label>`
+}
+
+function banButton(instance: InstanceRow): string {
+  if (instance.machineId == null) return "—"
+  return `<form method="post" action="/instances/${instance.vastInstanceId}/ban" onsubmit="return confirm('Ban machine ${instance.machineId} and destroy this instance?')">
+    <button type="submit" class="ghost">Ban</button>
+  </form>`
+}
+
+function speedText(instance: InstanceRow, template: TemplateRow | undefined): string {
+  if (!template?.tags.some(isTextTag)) return "—"
+  if (instance.speedError) return "failed"
+  if (instance.speedTokensPerSec == null) return "—"
+  const rate = instance.speedTokensPerSec.toFixed(1)
+  return instance.speedModel ? `${rate} · ${instance.speedModel}` : rate
 }
 
 function money(value: number | null | undefined, digits: number): string {

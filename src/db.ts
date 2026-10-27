@@ -46,6 +46,10 @@ export type InstanceRow = {
   lastProbeAt: Date | null
   readyAt: Date | null
   probes: ProbeSample[]
+  speedTokensPerSec: number | null
+  speedModel: string | null
+  speedAt: Date | null
+  speedError: string | null
 }
 
 export type ProbeSample = {
@@ -105,12 +109,16 @@ export type BlacklistRow = {
   updatedAt: Date
 }
 
-type InstanceDoc = Omit<InstanceRow, "firstSeenAt" | "lastVastSyncAt" | "lastProbeAt" | "readyAt" | "probes"> & {
+type InstanceDoc = Omit<InstanceRow, "firstSeenAt" | "lastVastSyncAt" | "lastProbeAt" | "readyAt" | "speedAt" | "probes"> & {
   firstSeenAt: string
   lastVastSyncAt: string | null
   lastProbeAt: string | null
   readyAt: string | null
+  speedAt?: string | null
   probes?: ProbeSample[]
+  speedTokensPerSec?: number | null
+  speedModel?: string | null
+  speedError?: string | null
 }
 
 type PendingDoc = { offerId: number; templateHashId: string; createdAt: string }
@@ -201,7 +209,7 @@ export async function listInstancesForTag(tag: Tag): Promise<InstanceRow[]> {
   return (await listInstances()).filter(row => row.templateHashId != null && active.has(row.templateHashId))
 }
 
-export async function upsertInstance(row: Omit<InstanceRow, "firstSeenAt" | "lastVastSyncAt" | "lastProbeAt" | "readyAt" | "probeStatus" | "probes"> & { probeStatus?: ProbeStatus | null }): Promise<void> {
+export async function upsertInstance(row: Omit<InstanceRow, "firstSeenAt" | "lastVastSyncAt" | "lastProbeAt" | "readyAt" | "probeStatus" | "probes" | "speedTokensPerSec" | "speedModel" | "speedAt" | "speedError"> & { probeStatus?: ProbeStatus | null }): Promise<void> {
   const now = new Date().toISOString()
   await updateDoc<InstanceDoc[]>(KEYS.instances, [], docs => {
     const current = docs.find(doc => doc.vastInstanceId === row.vastInstanceId)
@@ -217,6 +225,10 @@ export async function upsertInstance(row: Omit<InstanceRow, "firstSeenAt" | "las
           lastProbeAt: current.lastProbeAt,
           readyAt: current.readyAt ?? null,
           probes: current.probes ?? [],
+          speedTokensPerSec: current.speedTokensPerSec ?? null,
+          speedModel: current.speedModel ?? null,
+          speedAt: current.speedAt ?? null,
+          speedError: current.speedError ?? null,
         }
       : {
           ...row,
@@ -227,6 +239,10 @@ export async function upsertInstance(row: Omit<InstanceRow, "firstSeenAt" | "las
           lastProbeAt: null,
           readyAt: null,
           probes: [],
+          speedTokensPerSec: null,
+          speedModel: null,
+          speedAt: null,
+          speedError: null,
         }
     return [...docs.filter(doc => doc.vastInstanceId !== row.vastInstanceId), next]
   })
@@ -253,6 +269,26 @@ export async function setProbe(
         readyAt: doc.readyAt ?? (isServing(status) ? now : null),
         probes,
         ...(endpoint ?? {}),
+      }
+    }),
+  )
+}
+
+export async function setSpeed(
+  vastInstanceId: number,
+  sample: { tokensPerSec: number | null; model: string | null; error: string | null },
+  now = new Date(),
+): Promise<void> {
+  const at = now.toISOString()
+  await updateDoc<InstanceDoc[]>(KEYS.instances, [], docs =>
+    docs.map(doc => {
+      if (doc.vastInstanceId !== vastInstanceId) return doc
+      return {
+        ...doc,
+        speedTokensPerSec: sample.tokensPerSec,
+        speedModel: sample.model,
+        speedAt: at,
+        speedError: sample.error,
       }
     }),
   )
@@ -394,5 +430,9 @@ function hydrateInstance(doc: InstanceDoc): InstanceRow {
     lastProbeAt: doc.lastProbeAt ? new Date(doc.lastProbeAt) : null,
     readyAt: doc.readyAt ? new Date(doc.readyAt) : null,
     probes: Array.isArray(doc.probes) ? doc.probes.slice(-PROBE_HISTORY) : [],
+    speedTokensPerSec: typeof doc.speedTokensPerSec === "number" && Number.isFinite(doc.speedTokensPerSec) ? doc.speedTokensPerSec : null,
+    speedModel: typeof doc.speedModel === "string" && doc.speedModel ? doc.speedModel : null,
+    speedAt: doc.speedAt ? new Date(doc.speedAt) : null,
+    speedError: typeof doc.speedError === "string" && doc.speedError ? doc.speedError : null,
   }
 }
