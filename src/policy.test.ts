@@ -5,7 +5,9 @@ import {
   buildSearchBody,
   compareMetrics,
   isBetter,
+  applyDerivedMetrics,
   metricsFrom,
+  type MetricMap,
   optimizationPlan,
   detectContainerPort,
   hostPortFor,
@@ -78,15 +80,19 @@ describe("optimize", () => {
     assert.deepEqual(optimizationPlan(search, { gpu_ram: 8000 }, goals), [0.05])
   })
 
-  it("scores GPU bandwidth times fraction per dollar", () => {
+  it("scores GPU bandwidth per dollar without the GPU fraction", () => {
     const offer = metricsFrom({ gpu_mem_bw: 1000, gpu_frac: 0.5, dph_total: 0.05 })
-    assert.equal(offer.bw_frac_per_dollar, 10000)
-    const goals = [{ field: "bw_frac_per_dollar" as const, direction: "higher" as const, minGain: null }]
+    assert.equal(offer.bw_per_dollar, 20000)
+    assert.equal(offer.gpu_frac, 0.5)
+    const goals = [{ field: "bw_per_dollar" as const, direction: "higher" as const, minGain: null }]
     const full = metricsFrom({ gpu_mem_bw: 1000, gpu_frac: 1, dph_total: 0.05 })
     const slice = metricsFrom({ gpu_mem_bw: 1000, gpu_frac: 0.5, dph_total: 0.05 })
-    assert.equal(isBetter(full, slice, goals), true)
-    assert.equal(isBetter(metricsFrom({ gpu_mem_bw: 1000, gpu_frac: 1, dph_total: 0.04 }), full, goals), true)
-    assert.equal(metricsFrom({ gpu_mem_bw: 1000, gpu_frac: 1 }).bw_frac_per_dollar, undefined)
+    assert.equal(isBetter(full, slice, goals), false)
+    assert.equal(isBetter(metricsFrom({ gpu_mem_bw: 1000, dph_total: 0.04 }), full, goals), true)
+    assert.equal(metricsFrom({ gpu_mem_bw: 1000 }).bw_per_dollar, undefined)
+    const stored = applyDerivedMetrics({ gpu_mem_bw: 1000, dph_total: 0.05, bw_frac_per_dollar: 1 } as MetricMap)
+    assert.equal(stored.bw_per_dollar, 20000)
+    assert.equal("bw_frac_per_dollar" in stored, false)
     assert.deepEqual(optimizationPlan(search, full, goals), [0.05])
   })
 

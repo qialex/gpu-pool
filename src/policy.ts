@@ -40,7 +40,7 @@ export const OPTIMIZE_FIELDS = [
   "cpu_ram",
   "gpu_frac",
   "direct_port_count",
-  "bw_frac_per_dollar",
+  "bw_per_dollar",
 ] as const
 
 export type OptimizeField = (typeof OPTIMIZE_FIELDS)[number]
@@ -66,7 +66,7 @@ export const OPTIMIZE_FIELD_LABELS: Record<OptimizeField, string> = {
   cpu_ram: "CPU RAM MB",
   gpu_frac: "GPU fraction",
   direct_port_count: "Direct ports",
-  bw_frac_per_dollar: "GPU bandwidth × fraction / $",
+  bw_per_dollar: "GPU bandwidth / $",
 }
 
 export const OPTIMIZE_SLOTS = 3
@@ -116,24 +116,22 @@ const METRIC_ALIASES: Partial<Record<OptimizeField, string[]>> = {
 export function metricsFrom(row: Record<string, unknown>): MetricMap {
   const out: MetricMap = {}
   for (const field of OPTIMIZE_FIELDS) {
-    if (field === "bw_frac_per_dollar") continue
+    if (field === "bw_per_dollar") continue
     const n = metricNumber(row[field]) ?? aliasNumber(row, METRIC_ALIASES[field])
     if (n != null) out[field] = n
   }
   return applyDerivedMetrics(out)
 }
 
-/** GPU mem bandwidth × GPU fraction ÷ $/hr. Vast does not send this value. */
+/** GPU mem bandwidth ÷ $/hr. Vast does not send this value. */
 export function applyDerivedMetrics(metrics: MetricMap): MetricMap {
   const bandwidth = metrics.gpu_mem_bw
-  const fraction = metrics.gpu_frac
   const price = metrics.dph_total
-  if (bandwidth == null || fraction == null || price == null || price <= 0) {
-    const rest = { ...metrics }
-    delete rest.bw_frac_per_dollar
-    return rest
-  }
-  return { ...metrics, bw_frac_per_dollar: (bandwidth * fraction) / price }
+  const rest = { ...metrics }
+  delete rest.bw_per_dollar
+  delete (rest as MetricMap & { bw_frac_per_dollar?: number }).bw_frac_per_dollar
+  if (bandwidth == null || price == null || price <= 0) return rest
+  return { ...rest, bw_per_dollar: bandwidth / price }
 }
 
 function metricNumber(value: unknown): number | null {

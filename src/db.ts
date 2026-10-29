@@ -1,4 +1,4 @@
-import { blacklistBan, isServing, type Criteria, type MetricMap, type OptimizeGoal, type ProbeStatus, type Tag } from "./policy.js"
+import { applyDerivedMetrics, blacklistBan, isServing, type Criteria, type MetricMap, type OptimizeGoal, type ProbeStatus, type Tag } from "./policy.js"
 import { readDoc, redis, updateDoc } from "./redis.js"
 
 export type TemplateRow = {
@@ -138,7 +138,9 @@ const PROBE_HISTORY = 3
 
 export async function listTemplates(): Promise<TemplateRow[]> {
   const rows = await readDoc<TemplateRow[]>(KEYS.templates, [])
-  return rows.sort((a, b) => (a.name ?? a.hashId).localeCompare(b.name ?? b.hashId))
+  return rows
+    .map(row => ({ ...row, optimize: (row.optimize ?? []).map(normalizeOptimizeGoal) }))
+    .sort((a, b) => (a.name ?? a.hashId).localeCompare(b.name ?? b.hashId))
 }
 
 export async function getTemplate(hashId: string): Promise<TemplateRow | null> {
@@ -219,7 +221,7 @@ export async function upsertInstance(row: Omit<InstanceRow, "firstSeenAt" | "las
           ...row,
           probeStatus: row.probeStatus ?? current.probeStatus,
           machineId: row.machineId ?? current.machineId,
-          metrics: { ...current.metrics, ...row.metrics },
+          metrics: applyDerivedMetrics({ ...current.metrics, ...row.metrics }),
           firstSeenAt: current.firstSeenAt,
           lastVastSyncAt: now,
           lastProbeAt: current.lastProbeAt,
@@ -233,7 +235,7 @@ export async function upsertInstance(row: Omit<InstanceRow, "firstSeenAt" | "las
       : {
           ...row,
           probeStatus: row.probeStatus ?? null,
-          metrics: row.metrics,
+          metrics: applyDerivedMetrics(row.metrics),
           firstSeenAt: now,
           lastVastSyncAt: now,
           lastProbeAt: null,
@@ -353,7 +355,7 @@ export async function blacklistMachine(
       tags: snapshot.tags,
       gpuName: snapshot.gpuName,
       dphTotal: snapshot.dphTotal,
-      metrics: snapshot.metrics,
+      metrics: applyDerivedMetrics(snapshot.metrics),
       updatedAt: now.toISOString(),
     }
     return [...docs.filter(doc => doc.machineId !== machineId), next]
@@ -393,7 +395,12 @@ export async function listMachineEvents(machineId: number, now = new Date()): Pr
 export async function listBlacklist(): Promise<BlacklistRow[]> {
   const docs = await readDoc<BlacklistDoc[]>(KEYS.blacklist, [])
   return docs
-    .map(doc => ({ ...doc, bannedUntil: new Date(doc.bannedUntil), updatedAt: new Date(doc.updatedAt) }))
+    .map(doc => ({
+      ...doc,
+      metrics: applyDerivedMetrics(doc.metrics),
+      bannedUntil: new Date(doc.bannedUntil),
+      updatedAt: new Date(doc.updatedAt),
+    }))
     .sort((a, b) => b.bannedUntil.getTime() - a.bannedUntil.getTime())
 }
 
@@ -422,9 +429,14 @@ export async function deleteSession(token: string): Promise<void> {
   await redis([["DEL", `session:${token}`]])
 }
 
+function normalizeOptimizeGoal(goal: OptimizeGoal): OptimizeGoal {
+  return (goal.field as string) === "bw_frac_per_dollar" ? { ...goal, field: "bw_per_dollar" } : goal
+}
+
 function hydrateInstance(doc: InstanceDoc): InstanceRow {
   return {
     ...doc,
+    metrics: applyDerivedMetrics(doc.metrics),
     firstSeenAt: new Date(doc.firstSeenAt),
     lastVastSyncAt: doc.lastVastSyncAt ? new Date(doc.lastVastSyncAt) : null,
     lastProbeAt: doc.lastProbeAt ? new Date(doc.lastProbeAt) : null,

@@ -218,7 +218,7 @@ function rentedTable(instances: InstanceRow[], byHash: Map<string, TemplateRow>)
       <td>${vram(instance.metrics.gpu_ram)}</td>
       <td>${metric(instance.metrics.gpu_frac, 2)}</td>
       <td>${metric(instance.metrics.gpu_mem_bw, 0)}</td>
-      <td>${metric(instance.metrics.bw_frac_per_dollar, 0)}</td>
+      <td>${metric(instance.metrics.bw_per_dollar, 0)}</td>
       <td>${esc(instance.publicIp ?? "—")}:${esc(instance.hostPort ?? "—")}</td>
       <td>${esc(instance.actualStatus ?? "provisioning")}</td>
       <td>${esc(instance.intendedStatus ?? "—")}</td>
@@ -233,7 +233,7 @@ function rentedTable(instances: InstanceRow[], byHash: Map<string, TemplateRow>)
   return `<div class="table-wrap"><table>
     <thead><tr>
       <th></th><th>Id</th><th>Machine</th><th>Template</th><th>Tag</th><th>GPU</th><th>$/hr</th><th>$/mo</th>
-      <th>VRAM</th><th>GPU frac</th><th>Mem GB/s</th><th>BW×frac/$</th><th>Endpoint</th>
+      <th>VRAM</th><th>GPU frac</th><th>Mem GB/s</th><th>BW/$</th><th>Endpoint</th>
       <th>Vast</th><th>Intended</th><th>Probe</th><th>tok/s</th><th>Age</th><th>Last probe</th><th>Message</th><th></th>
     </tr></thead>
     <tbody>${rows}</tbody>
@@ -255,7 +255,7 @@ function blacklistTable(rows: BlacklistRow[]): string {
       <td>${vram(row.metrics.gpu_ram)}</td>
       <td>${metric(row.metrics.gpu_frac, 2)}</td>
       <td>${metric(row.metrics.gpu_mem_bw, 0)}</td>
-      <td>${metric(row.metrics.bw_frac_per_dollar, 0)}</td>
+      <td>${metric(row.metrics.bw_per_dollar, 0)}</td>
       <td>${row.strikes}</td>
       <td>${active ? "banned" : "expired"}</td>
       <td>${esc(row.bannedUntil.toISOString())}</td>
@@ -270,7 +270,7 @@ function blacklistTable(rows: BlacklistRow[]): string {
   return `<div class="table-wrap"><table>
     <thead><tr>
       <th></th><th>Machine</th><th>Template</th><th>Tag</th><th>GPU</th><th>$/hr</th><th>$/mo</th>
-      <th>VRAM</th><th>GPU frac</th><th>Mem GB/s</th><th>BW×frac/$</th>
+      <th>VRAM</th><th>GPU frac</th><th>Mem GB/s</th><th>BW/$</th>
       <th>Failures</th><th>Status</th><th>Until</th><th>Last reason</th><th></th>
     </tr></thead>
     <tbody>${body}</tbody>
