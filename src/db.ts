@@ -252,6 +252,7 @@ export async function upsertInstance(row: Omit<InstanceRow, "firstSeenAt" | "las
 
 export async function deleteInstance(vastInstanceId: number): Promise<void> {
   await updateDoc<InstanceDoc[]>(KEYS.instances, [], docs => docs.filter(doc => doc.vastInstanceId !== vastInstanceId))
+  await deletePending(vastInstanceId)
 }
 
 export async function setProbe(
@@ -298,7 +299,16 @@ export async function setSpeed(
 
 export async function deleteInstancesExcept(ids: number[]): Promise<void> {
   const keep = new Set(ids)
-  await updateDoc<InstanceDoc[]>(KEYS.instances, [], docs => docs.filter(doc => keep.has(doc.vastInstanceId)))
+  const removed: number[] = []
+  await updateDoc<InstanceDoc[]>(KEYS.instances, [], docs => {
+    for (const doc of docs) {
+      if (!keep.has(doc.vastInstanceId)) removed.push(doc.vastInstanceId)
+    }
+    return docs.filter(doc => keep.has(doc.vastInstanceId))
+  })
+  if (removed.length === 0) return
+  const gone = new Set(removed)
+  await updateDoc<PendingDoc[]>(KEYS.pending, [], docs => docs.filter(doc => !gone.has(doc.offerId)))
 }
 
 export async function addPendingLaunch(templateHashId: string, contractId: number): Promise<void> {

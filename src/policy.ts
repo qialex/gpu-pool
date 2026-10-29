@@ -218,6 +218,11 @@ export function countsAsWorking(readyAt: Date | null): boolean {
   return readyAt != null
 }
 
+/** A desired-count slot. A machine that has never been healthy does not hold one. */
+export function fillsDesiredSlot(actualStatus: string | null, readyAt: Date | null): boolean {
+  return occupiesSlot(actualStatus) && countsAsWorking(readyAt)
+}
+
 /**
  * How many more machines to rent while proven machines are still short of Instances.
  * Null means burst does not apply. Zero means the burst slots are full and the caller should wait.

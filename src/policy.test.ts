@@ -15,6 +15,7 @@ import {
   burstRentCount,
   burstStillWaiting,
   countsAsWorking,
+  fillsDesiredSlot,
   isServing,
   occupiesSlot,
   priceCeilings,
@@ -119,6 +120,17 @@ describe("countsAsWorking", () => {
   it("counts a machine only after it has come ready, including through a later outage", () => {
     assert.equal(countsAsWorking(null), false)
     assert.equal(countsAsWorking(new Date()), true)
+  })
+})
+
+describe("fillsDesiredSlot", () => {
+  it("leaves a machine that has never been healthy out of the running slots", () => {
+    const ready = new Date()
+    assert.equal(fillsDesiredSlot("running", null), false)
+    assert.equal(fillsDesiredSlot("loading", null), false)
+    assert.equal(fillsDesiredSlot("running", ready), true)
+    assert.equal(fillsDesiredSlot("loading", ready), true)
+    assert.equal(fillsDesiredSlot("exited", ready), false)
   })
 })
 

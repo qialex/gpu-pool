@@ -29,6 +29,7 @@ import {
   burstRentCount,
   burstStillWaiting,
   countsAsWorking,
+  fillsDesiredSlot,
   hostPortFor,
   instanceRoot,
   compareMetrics,
@@ -312,7 +313,9 @@ async function rentShortfalls(apiKey: string, templates: TemplateRow[], instance
       continue
     }
     const mine = instances.filter(instance => instance.templateHashId === template.hashId)
-    const occupying = mine.filter(instance => occupiesSlot(instance.actualStatus)).length + await countPending(template.hashId, mine.map(instance => instance.vastInstanceId))
+    const pending = await countPending(template.hashId, mine.map(instance => instance.vastInstanceId))
+    const occupying = mine.filter(instance => occupiesSlot(instance.actualStatus)).length + pending
+    const runningSlots = mine.filter(instance => fillsDesiredSlot(instance.actualStatus, instance.readyAt)).length + pending
     const search = {
       min: template.priceMin,
       step: template.priceStep,
@@ -344,7 +347,7 @@ async function rentShortfalls(apiKey: string, templates: TemplateRow[], instance
       continue
     }
     if (burstWaiting) continue
-    if (occupying < template.desiredCount) {
+    if (runningSlots < template.desiredCount) {
       const plan = priceSearchPlan(search)
       if (plan.length === 0) continue
       const rented = await rentFirstOffer(apiKey, template, plan, banned, null, new Set(), "below desired count")
