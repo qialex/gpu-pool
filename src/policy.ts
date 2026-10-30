@@ -20,6 +20,8 @@ export type Criteria = {
   datacenter?: boolean | null
   /** Require Vast verification. Default true. */
   verified?: boolean | null
+  /** text_regular and text_premium only. Measured after the model is ready, not on the Vast offer. */
+  tokensPerSecMin?: number | null
 }
 
 export type PriceSearch = {
@@ -41,6 +43,7 @@ export const OPTIMIZE_FIELDS = [
   "gpu_frac",
   "direct_port_count",
   "bw_per_dollar",
+  "tokens_per_sec",
 ] as const
 
 export type OptimizeField = (typeof OPTIMIZE_FIELDS)[number]
@@ -67,6 +70,7 @@ export const OPTIMIZE_FIELD_LABELS: Record<OptimizeField, string> = {
   gpu_frac: "GPU fraction",
   direct_port_count: "Direct ports",
   bw_per_dollar: "GPU bandwidth / $",
+  tokens_per_sec: "tok/s",
 }
 
 export const OPTIMIZE_SLOTS = 3
@@ -75,7 +79,12 @@ const LOADING_DEADLINE_MS = 40 * 60 * 1000
 const REBOOT_DEADLINE_MS = 10 * 60 * 1000
 const BLACKLIST_WEEK_MS = 7 * 24 * 60 * 60 * 1000
 
-/** Next global ban after a machine fails to load. Strikes are kept after the ban ends. */
+/** True while the ban time is still in the future. An expired ban is off the list. */
+export function banIsActive(bannedUntilMs: number, nowMs: number): boolean {
+  return Number.isFinite(bannedUntilMs) && bannedUntilMs > nowMs
+}
+
+/** Next global ban after a machine fails to load. Strikes stay stored after the ban leaves the list. */
 export function blacklistBan(previousStrikes: number, nowMs: number): { strikes: number; bannedUntilMs: number } {
   const strikes = Math.max(0, Math.floor(previousStrikes)) + 1
   return { strikes, bannedUntilMs: nowMs + strikes * BLACKLIST_WEEK_MS }
@@ -89,12 +98,14 @@ export function isTextTag(tag: Tag): boolean {
   return tag === "text_regular" || tag === "text_premium"
 }
 
-const SPEED_INTERVAL_MS = 60 * 60 * 1000
+const SPEED_RETRY_MS = 60 * 1000
+const SPEED_OK_INTERVAL_MS = 10 * 60 * 1000
 
-/** True when a text instance has never been timed, or the last attempt is at least an hour old. */
-export function textSpeedDue(lastAttemptMs: number | null, nowMs: number): boolean {
+/** True when a text instance should be timed again. A failure retries after a minute. A successful sample waits ten minutes. */
+export function textSpeedDue(lastAttemptMs: number | null, nowMs: number, lastOk: boolean): boolean {
   if (lastAttemptMs == null || !Number.isFinite(lastAttemptMs)) return true
-  return nowMs - lastAttemptMs >= SPEED_INTERVAL_MS
+  const wait = lastOk ? SPEED_OK_INTERVAL_MS : SPEED_RETRY_MS
+  return nowMs - lastAttemptMs >= wait
 }
 
 /** Completion tokens divided by the full request time. Missing or empty timings are not a sample. */
@@ -102,6 +113,19 @@ export function tokensPerSecond(completionTokens: number, elapsedMs: number): nu
   if (!Number.isFinite(completionTokens) || completionTokens < 0) return null
   if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return null
   return completionTokens / (elapsedMs / 1000)
+}
+
+/** Measured tok/s on a running text instance. Vast offers do not carry this number. */
+export function withSpeed(metrics: MetricMap, tokensPerSec: number | null): MetricMap {
+  if (tokensPerSec == null || !Number.isFinite(tokensPerSec)) return metrics
+  return { ...metrics, tokens_per_sec: tokensPerSec }
+}
+
+/** A finished sample under the template minimum. No sample is not a failure. */
+export function belowTokensPerSecMin(tokensPerSec: number | null, min: number | null | undefined): boolean {
+  if (min == null || !Number.isFinite(min)) return false
+  if (tokensPerSec == null || !Number.isFinite(tokensPerSec)) return false
+  return tokensPerSec < min
 }
 
 export function isOptimizeField(value: string | null | undefined): value is OptimizeField {
@@ -116,7 +140,7 @@ const METRIC_ALIASES: Partial<Record<OptimizeField, string[]>> = {
 export function metricsFrom(row: Record<string, unknown>): MetricMap {
   const out: MetricMap = {}
   for (const field of OPTIMIZE_FIELDS) {
-    if (field === "bw_per_dollar") continue
+    if (field === "bw_per_dollar" || field === "tokens_per_sec") continue
     const n = metricNumber(row[field]) ?? aliasNumber(row, METRIC_ALIASES[field])
     if (n != null) out[field] = n
   }
@@ -188,6 +212,57 @@ export function compareMetrics(a: MetricMap, b: MetricMap, goals: OptimizeGoal[]
     if (delta < 0) return 1
   }
   return 0
+}
+
+/**
+ * Rank two running instances. A missing tok/s sample is unknown, not slow.
+ * A tok/s difference inside its gain is a tie.
+ */
+export function compareHeld(a: MetricMap, b: MetricMap, goals: OptimizeGoal[]): number {
+  const ranked = goals.length > 0 ? goals : [{ field: "dph_total" as const, direction: "lower" as const, minGain: null }]
+  for (const goal of ranked) {
+    const left = a[goal.field]
+    const right = b[goal.field]
+    if (goal.field === "tokens_per_sec" && (left == null || right == null)) continue
+    if (left == null && right == null) continue
+    if (left == null) return 1
+    if (right == null) return -1
+    const delta = goalDelta(left, right, goal.direction)
+    if (goal.field === "tokens_per_sec") {
+      const gain = goal.minGain != null && goal.minGain > 0 ? goal.minGain : 0
+      if (gain > 0) {
+        if (delta + 1e-9 >= gain) return -1
+        if (delta <= -gain + 1e-9) return 1
+        continue
+      }
+    }
+    if (delta > 0) return -1
+    if (delta < 0) return 1
+  }
+  return 0
+}
+
+/**
+ * Rent a text trial when tok/s is a goal, the current machine has a sample, and the offer does not.
+ * An earlier goal that is already worse still rejects the offer.
+ */
+export function acceptsUnmeasuredSpeed(candidate: MetricMap, incumbent: MetricMap, goals: OptimizeGoal[]): boolean {
+  if (incumbent.tokens_per_sec == null || candidate.tokens_per_sec != null) return false
+  if (!goals.some(goal => goal.field === "tokens_per_sec")) return false
+  for (const goal of goals) {
+    if (goal.field === "tokens_per_sec") continue
+    const left = candidate[goal.field]
+    const right = incumbent[goal.field]
+    if (left == null || right == null) continue
+    const delta = goalDelta(left, right, goal.direction)
+    const gain = goal.minGain != null && goal.minGain > 0 ? goal.minGain : 0
+    if (gain === 0) {
+      if (delta < 0) return false
+      continue
+    }
+    if (delta <= -gain + 1e-9) return false
+  }
+  return true
 }
 
 /**

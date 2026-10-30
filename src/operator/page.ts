@@ -5,6 +5,7 @@ import {
   OPTIMIZE_FIELDS,
   OPTIMIZE_SLOTS,
   TAGS,
+  banIsActive,
   isOptimizeField,
   isTextTag,
   type Criteria,
@@ -62,6 +63,7 @@ export function snapshotParts(
   blacklist: BlacklistRow[],
 ): { templates: string; rented: string; blacklist: string } {
   const byHash = new Map(templates.map(template => [template.hashId, template]))
+  const bans = blacklist.filter(row => banIsActive(row.bannedUntil.getTime(), Date.now()))
   return {
     templates: `
       <div class="title">
@@ -78,8 +80,8 @@ export function snapshotParts(
     `,
     blacklist: `
       <h2>Blacklist</h2>
-      <p class="muted">Global. A machine that fails to load is skipped for every template. The first failure lasts one week, the next two weeks, then three, and the count stays after the ban ends.</p>
-      ${blacklist.length === 0 ? `<p class="muted">No machines are blacklisted.</p>` : blacklistTable(blacklist)}
+      <p class="muted">Global. A machine that fails to load is skipped for every template. The first failure lasts one week, the next two weeks, then three. When that time ends, the machine leaves this list on its own. The failure count stays, so the next ban is longer.</p>
+      ${bans.length === 0 ? `<p class="muted">No machines are blacklisted.</p>` : blacklistTable(bans)}
     `,
   }
 }
@@ -167,12 +169,13 @@ function templateCard(template: TemplateRow): string {
         ${numField("price_step", "Price step $/hr", template.priceStep, "0.05")}
         ${numField("price_loops", "Loops per price", template.priceLoops, "10")}
         ${numField("price_max", "Price max $/hr", template.priceMax, "0.50")}
-        ${optimizeFields(template.optimize)}
+        ${optimizeFields(template)}
         ${numField("disk_gb", "Disk GB exact", template.diskGb, "40")}
         ${numField("container_port", "Port override", template.containerPort, String(template.detectedPort ?? ""))}
         <label>Health path
           <input name="health_path" value="${esc(template.healthPath ?? "")}" placeholder="/health or /v1/models">
         </label>
+        ${numField("tokens_per_sec_min", "Min tok/s", c.tokensPerSecMin, "40")}
         ${numField("gpu_frac_min", "Min GPU fraction", c.gpuFracMin, "1")}
         ${numField("gpu_mem_bw_min", "Min GPU mem GB/s", c.gpuMemBwMin, "")}
         ${numField("reliability_min", "Min reliability", c.reliabilityMin, "0.99")}
@@ -277,7 +280,8 @@ function blacklistTable(rows: BlacklistRow[]): string {
   </table></div>`
 }
 
-function optimizeFields(goals: OptimizeGoal[]): string {
+function optimizeFields(template: TemplateRow): string {
+  const goals = template.optimize
   const rows = Array.from({ length: OPTIMIZE_SLOTS }, (_, index) => {
     const goal = goals[index]
     const field = goal?.field ?? ""
@@ -296,7 +300,7 @@ function optimizeFields(goals: OptimizeGoal[]): string {
   }).join("")
   return `<div class="optimize">
     <span>Optimize</span>
-    <p class="hint">First row that clears its gain wins. Blank gain means any improvement. Leave all rows on none to only fill missing instances. Leave optimize trials empty to keep it off. Instances is how many must have come ready. One that already did still counts through a short outage. Burst is how many to rent while none have come ready. A machine that has never been ready only fills a burst slot, until its first ready probe.</p>
+    <p class="hint">First row that clears its gain wins. Blank gain means any improvement. Leave all rows on none to only fill missing instances. Leave optimize trials empty to keep it off. Instances is how many must have come ready. One that already did still counts through a short outage. Burst is how many to rent while none have come ready. A machine that has never been ready only fills a burst slot, until its first ready probe. For text_regular and text_premium, tok/s is measured after the model is ready. Min tok/s destroys a slower machine and bans it. Choosing tok/s rents a trial up to the price max, then keeps the faster one.</p>
     ${rows}
   </div>`
 }
@@ -476,6 +480,7 @@ export function parseCriteria(form: URLSearchParams): Criteria {
     directPortCountMin: optionalNumber(form.get("direct_port_count_min")),
     cudaMaxGoodMin: optionalNumber(form.get("cuda_max_good_min")),
     cpuRamMin: optionalNumber(form.get("cpu_ram_min")),
+    tokensPerSecMin: optionalNumber(form.get("tokens_per_sec_min")),
     geolocation: list("geolocation")?.map(code => code.toUpperCase()) ?? null,
     datacenter: parseTri(form.get("datacenter") ?? undefined),
     verified: form.get("verified") === "1",

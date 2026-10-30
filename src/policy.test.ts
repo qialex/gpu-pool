@@ -1,8 +1,12 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 import {
+  acceptsUnmeasuredSpeed,
+  banIsActive,
+  belowTokensPerSecMin,
   blacklistBan,
   buildSearchBody,
+  compareHeld,
   compareMetrics,
   isBetter,
   applyDerivedMetrics,
@@ -25,6 +29,7 @@ import {
   isTextTag,
   textSpeedDue,
   tokensPerSecond,
+  withSpeed,
 } from "./policy.ts"
 
 describe("priceCeilings", () => {
@@ -200,6 +205,13 @@ describe("blacklistBan", () => {
     assert.deepEqual(blacklistBan(1, now), { strikes: 2, bannedUntilMs: now + 2 * week })
     assert.deepEqual(blacklistBan(2, now), { strikes: 3, bannedUntilMs: now + 3 * week })
   })
+
+  it("drops a machine from the ban once the time has passed", () => {
+    const until = Date.parse("2026-10-26T00:00:00.000Z")
+    assert.equal(banIsActive(until, until - 1), true)
+    assert.equal(banIsActive(until, until), false)
+    assert.equal(banIsActive(until, until + 1), false)
+  })
 })
 
 describe("search body", () => {
@@ -215,6 +227,17 @@ describe("search body", () => {
     assert.deepEqual(body.disk_space, { gte: 40 })
     assert.deepEqual(body.gpu_name, { eq: "RTX_4090" })
     assert.deepEqual(body.verification, { eq: "verified" })
+    assert.equal("tokens_per_sec" in body, false)
+  })
+
+  it("does not send tok/s to Vast", () => {
+    const body = buildSearchBody({
+      ceiling: 0.2,
+      diskGb: 40,
+      criteria: { tokensPerSecMin: 40, verified: true },
+      extraFilters: null,
+    })
+    assert.equal(body.tokens_per_sec, undefined)
   })
 })
 
@@ -228,16 +251,65 @@ describe("isTextTag", () => {
 })
 
 describe("textSpeedDue", () => {
-  const hour = 60 * 60 * 1000
+  const minute = 60 * 1000
+  const tenMinutes = 10 * minute
 
   it("is due when there has been no attempt", () => {
-    assert.equal(textSpeedDue(null, 1_000), true)
+    assert.equal(textSpeedDue(null, 1_000, false), true)
+    assert.equal(textSpeedDue(null, 1_000, true), true)
   })
 
-  it("waits an hour after the last attempt", () => {
-    const now = 10 * hour
-    assert.equal(textSpeedDue(now - hour + 1, now), false)
-    assert.equal(textSpeedDue(now - hour, now), true)
+  it("retries a failure after a minute", () => {
+    const now = 20 * minute
+    assert.equal(textSpeedDue(now - minute + 1, now, false), false)
+    assert.equal(textSpeedDue(now - minute, now, false), true)
+  })
+
+  it("waits ten minutes after a successful sample", () => {
+    const now = 20 * minute
+    assert.equal(textSpeedDue(now - tenMinutes + 1, now, true), false)
+    assert.equal(textSpeedDue(now - tenMinutes, now, true), true)
+  })
+})
+
+describe("text tok/s", () => {
+  const faster = [{ field: "tokens_per_sec" as const, direction: "higher" as const, minGain: 5 }]
+
+  it("keeps a measured rate on the instance and ignores a Vast offer", () => {
+    assert.equal(withSpeed({ dph_total: 0.2 }, 55).tokens_per_sec, 55)
+    assert.equal(withSpeed({ dph_total: 0.2 }, null).tokens_per_sec, undefined)
+    assert.equal(metricsFrom({ tokens_per_sec: 99, dph_total: 0.1 }).tokens_per_sec, undefined)
+  })
+
+  it("fails only a finished sample under the minimum", () => {
+    assert.equal(belowTokensPerSecMin(30, 40), true)
+    assert.equal(belowTokensPerSecMin(40, 40), false)
+    assert.equal(belowTokensPerSecMin(null, 40), false)
+    assert.equal(belowTokensPerSecMin(30, null), false)
+  })
+
+  it("rents a trial when the offer has no tok/s and the machine does", () => {
+    assert.equal(acceptsUnmeasuredSpeed({ dph_total: 0.2 }, { tokens_per_sec: 40 }, faster), true)
+    assert.equal(acceptsUnmeasuredSpeed({ tokens_per_sec: 50 }, { tokens_per_sec: 40 }, faster), false)
+    assert.equal(acceptsUnmeasuredSpeed({ dph_total: 0.2 }, {}, faster), false)
+    assert.equal(isBetter({ tokens_per_sec: 50 }, { tokens_per_sec: 40 }, faster), true)
+    assert.equal(isBetter({ tokens_per_sec: 42 }, { tokens_per_sec: 40 }, faster), false)
+    assert.deepEqual(optimizationPlan({ min: 0.01, step: 0.005, loops: 2, max: 0.05 }, { tokens_per_sec: 40 }, faster), [0.05])
+  })
+
+  it("rejects a trial that already loses an earlier goal", () => {
+    const goals = [
+      { field: "dph_total" as const, direction: "lower" as const, minGain: null },
+      { field: "tokens_per_sec" as const, direction: "higher" as const, minGain: null },
+    ]
+    assert.equal(acceptsUnmeasuredSpeed({ dph_total: 0.3 }, { dph_total: 0.2, tokens_per_sec: 40 }, goals), false)
+    assert.equal(acceptsUnmeasuredSpeed({ dph_total: 0.2 }, { dph_total: 0.2, tokens_per_sec: 40 }, goals), true)
+  })
+
+  it("does not treat a missing sample as slow, and ignores a gain that is too small", () => {
+    assert.equal(compareHeld({ dph_total: 0.2 }, { tokens_per_sec: 40 }, faster), 0)
+    assert.equal(compareHeld({ tokens_per_sec: 42 }, { tokens_per_sec: 40 }, faster), 0)
+    assert.ok(compareHeld({ tokens_per_sec: 45 }, { tokens_per_sec: 40 }, faster) < 0)
   })
 })
 

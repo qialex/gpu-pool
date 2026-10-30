@@ -1,4 +1,4 @@
-import { applyDerivedMetrics, blacklistBan, isServing, type Criteria, type MetricMap, type OptimizeGoal, type ProbeStatus, type Tag } from "./policy.js"
+import { applyDerivedMetrics, banIsActive, blacklistBan, isServing, type Criteria, type MetricMap, type OptimizeGoal, type ProbeStatus, type Tag } from "./policy.js"
 import { readDoc, redis, updateDoc } from "./redis.js"
 
 export type TemplateRow = {
@@ -402,7 +402,8 @@ export async function listMachineEvents(machineId: number, now = new Date()): Pr
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
 }
 
-export async function listBlacklist(): Promise<BlacklistRow[]> {
+/** Active bans. An expired row stays stored so the next failure keeps its strike count, and it is not on the list. */
+export async function listBlacklist(now = new Date()): Promise<BlacklistRow[]> {
   const docs = await readDoc<BlacklistDoc[]>(KEYS.blacklist, [])
   return docs
     .map(doc => ({
@@ -411,6 +412,7 @@ export async function listBlacklist(): Promise<BlacklistRow[]> {
       bannedUntil: new Date(doc.bannedUntil),
       updatedAt: new Date(doc.updatedAt),
     }))
+    .filter(row => banIsActive(row.bannedUntil.getTime(), now.getTime()))
     .sort((a, b) => b.bannedUntil.getTime() - a.bannedUntil.getTime())
 }
 
@@ -419,7 +421,7 @@ export async function activeBlacklistedMachineIds(now = new Date()): Promise<Set
 }
 
 export async function bannedMachineIds(now = new Date()): Promise<Set<number>> {
-  return new Set((await listBlacklist()).filter(row => row.bannedUntil > now).map(row => row.machineId))
+  return new Set((await listBlacklist(now)).map(row => row.machineId))
 }
 
 export async function deleteOperators(): Promise<void> {

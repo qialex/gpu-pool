@@ -22,12 +22,15 @@ import {
 import { probeUrl } from "./probe.js"
 import { measureTextSpeed } from "./speed.js"
 import {
+  acceptsUnmeasuredSpeed,
+  belowTokensPerSecMin,
   buildSearchBody,
   detectContainerPort,
   bestProbe,
   blacklistFailedLoad,
   burstRentCount,
   burstStillWaiting,
+  compareHeld,
   countsAsWorking,
   fillsDesiredSlot,
   hostPortFor,
@@ -45,6 +48,7 @@ import {
   stillStarting,
   stopRank,
   textSpeedDue,
+  withSpeed,
   type MetricMap,
   type OptimizeGoal,
   type ProbeStatus,
@@ -78,8 +82,11 @@ export async function reconcile(): Promise<void> {
   await pingRunning(fresh, templates)
   const afterPing = await listInstances()
   await measureReadyText(afterPing, templates)
-  await stopExtras(apiKey, templates, afterPing)
-  await rentShortfalls(apiKey, templates, afterPing)
+  const timed = await listInstances()
+  await releaseSlowText(apiKey, timed, templates)
+  const afterSpeed = await listInstances()
+  await stopExtras(apiKey, templates, afterSpeed)
+  await rentShortfalls(apiKey, templates, afterSpeed)
 }
 
 export async function syncTemplates(apiKey: string): Promise<TemplateRow[]> {
@@ -223,7 +230,8 @@ async function measureReadyText(instances: InstanceRow[], templates: TemplateRow
     if (!instance.publicIp || instance.hostPort == null) continue
     const template = instance.templateHashId ? byHash.get(instance.templateHashId) : undefined
     if (!template?.active || !template.tags.some(isTextTag)) continue
-    if (!textSpeedDue(instance.speedAt?.getTime() ?? null, now)) continue
+    const lastOk = instance.speedTokensPerSec != null && !instance.speedError
+    if (!textSpeedDue(instance.speedAt?.getTime() ?? null, now, lastOk)) continue
     const root = instanceRoot(instance.publicIp, instance.hostPort)
     try {
       const result = await measureTextSpeed(root)
@@ -254,6 +262,44 @@ async function measureReadyText(instances: InstanceRow[], templates: TemplateRow
   }
 }
 
+async function releaseSlowText(apiKey: string, instances: InstanceRow[], templates: TemplateRow[]): Promise<void> {
+  const byHash = new Map(templates.map(template => [template.hashId, template]))
+  for (const instance of instances) {
+    if (instance.actualStatus !== "running" || !isServing(instance.probeStatus)) continue
+    const template = instance.templateHashId ? byHash.get(instance.templateHashId) : undefined
+    if (!template?.active || !template.tags.some(isTextTag)) continue
+    const min = template.criteria?.tokensPerSecMin
+    if (!belowTokensPerSecMin(instance.speedTokensPerSec, min)) continue
+    const reason = `below min tok/s (${instance.speedTokensPerSec?.toFixed(1)} < ${min})`
+    try {
+      await destroyInstance(apiKey, instance.vastInstanceId)
+      await deleteInstance(instance.vastInstanceId)
+      log(`destroyed ${instance.vastInstanceId} (${reason})`)
+      await note(instance, byHash, "release", `destroyed (${reason})`)
+      if (instance.machineId == null) {
+        log(`instance ${instance.vastInstanceId} had no machine id, so it was not blacklisted`)
+        continue
+      }
+      try {
+        const ban = await blacklistMachine(instance.machineId, reason, {
+          templateHashId: instance.templateHashId,
+          templateName: template.name ?? null,
+          tags: template.tags,
+          gpuName: instance.gpuName,
+          dphTotal: instance.dphTotal,
+          metrics: instance.metrics,
+        })
+        log(`blacklisted machine ${instance.machineId} for ${ban.strikes} week(s), until ${ban.bannedUntil.toISOString()}`)
+        await note(instance, byHash, "ban", `${reason}, ${ban.strikes} week ban until ${ban.bannedUntil.toISOString()}`)
+      } catch (err) {
+        console.error(`[worker] blacklist machine ${instance.machineId} failed`, err)
+      }
+    } catch (err) {
+      console.error(`[worker] destroy ${instance.vastInstanceId} failed`, err)
+    }
+  }
+}
+
 async function stopExtras(apiKey: string, templates: TemplateRow[], instances: InstanceRow[]): Promise<void> {
   for (const template of templates) {
     if (!template.active) continue
@@ -265,7 +311,7 @@ async function stopExtras(apiKey: string, templates: TemplateRow[], instances: I
     const now = Date.now()
     if (template.burst > template.desiredCount) {
       const waiting = pending > 0 || held.some(instance => burstStillWaiting(instance.actualStatus, instance.probeStatus, ageMs(instance, now), countsAsWorking(instance.readyAt)))
-      if (waiting) continue
+      if (waiting || held.some(instance => needsSpeedSample(instance, template, now))) continue
       const keep = new Set(
         held
           .filter(instance => instance.actualStatus === "running" && isServing(instance.probeStatus))
@@ -285,7 +331,7 @@ async function stopExtras(apiKey: string, templates: TemplateRow[], instances: I
       continue
     }
     const overlap = template.desiredCount > 0 && template.optimize.length > 0 && template.optimizeTrials > 0
-    if (overlap && (pending > 0 || held.some(instance => stillStarting(instance.actualStatus, instance.probeStatus)))) {
+    if (overlap && (pending > 0 || held.some(instance => stillStarting(instance.actualStatus, instance.probeStatus)) || held.some(instance => needsSpeedSample(instance, template, now)))) {
       continue
     }
     const running = held
@@ -358,10 +404,11 @@ async function rentShortfalls(apiKey: string, templates: TemplateRow[], instance
     if (template.optimize.length === 0 || trialSlots <= 0 || occupying >= template.desiredCount + trialSlots) continue
     const worst = worstHeld(mine, template.optimize)
     if (!worst) continue
-    const plan = optimizationPlan(search, worst.metrics, template.optimize)
+    const worstMetrics = rankMetrics(worst)
+    const plan = optimizationPlan(search, worstMetrics, template.optimize)
     if (plan.length === 0) continue
     log(`optimizing ${named} against instance ${worst.vastInstanceId}`)
-    const rented = await rentFirstOffer(apiKey, template, plan, banned, worst.metrics, new Set(), `optimize against ${worst.vastInstanceId}`)
+    const rented = await rentFirstOffer(apiKey, template, plan, banned, worstMetrics, new Set(), `optimize against ${worst.vastInstanceId}`)
     if (!rented) log(`no better offer for ${named}`)
   }
 }
@@ -408,7 +455,9 @@ async function rentFirstOffer(
       })
       .sort((a, b) => compareMetrics(metricsFrom(a), metricsFrom(b), template.optimize))
     for (const offer of ranked) {
-      if (incumbent != null && !isBetter(metricsFrom(offer), incumbent, template.optimize)) continue
+      const metrics = metricsFrom(offer)
+      const speedTrial = incumbent != null && template.tags.some(isTextTag) && acceptsUnmeasuredSpeed(metrics, incumbent, template.optimize)
+      if (incumbent != null && !isBetter(metrics, incumbent, template.optimize) && !speedTrial) continue
       const id = offerId(offer)!
       try {
         const contractId = await createInstance(apiKey, id, {
@@ -504,7 +553,7 @@ function worstHeld(instances: InstanceRow[], goals: OptimizeGoal[]): InstanceRow
 
 function burstKeepOrder(a: InstanceRow, b: InstanceRow, goals: OptimizeGoal[]): number {
   if (goals.length > 0) {
-    const ranked = compareMetrics(a.metrics, b.metrics, goals)
+    const ranked = compareHeld(rankMetrics(a), rankMetrics(b), goals)
     if (ranked !== 0) return ranked
   }
   const aLoaded = (a.readyAt ?? a.firstSeenAt).getTime()
@@ -516,7 +565,28 @@ function worseFirst(a: InstanceRow, b: InstanceRow, goals: OptimizeGoal[]): numb
   const aReady = isServing(a.probeStatus) ? 1 : 0
   const bReady = isServing(b.probeStatus) ? 1 : 0
   if (aReady !== bReady) return aReady - bReady
-  return compareMetrics(b.metrics, a.metrics, goals)
+  const ranked = compareHeld(rankMetrics(b), rankMetrics(a), goals)
+  if (ranked !== 0 || !goals.some(goal => goal.field === "tokens_per_sec")) return ranked
+  const aLoaded = (a.readyAt ?? a.firstSeenAt).getTime()
+  const bLoaded = (b.readyAt ?? b.firstSeenAt).getTime()
+  return bLoaded - aLoaded || b.vastInstanceId - a.vastInstanceId
+}
+
+function rankMetrics(instance: InstanceRow): MetricMap {
+  return withSpeed(instance.metrics, instance.speedTokensPerSec)
+}
+
+const SPEED_WAIT_MS = 60 * 60 * 1000
+
+/** A ready text machine whose tok/s sample has not landed yet. */
+function needsSpeedSample(instance: InstanceRow, template: TemplateRow, now: number): boolean {
+  if (!template.tags.some(isTextTag)) return false
+  if (!template.optimize.some(goal => goal.field === "tokens_per_sec")) return false
+  if (instance.actualStatus !== "running" || !isServing(instance.probeStatus)) return false
+  if (instance.speedTokensPerSec != null || instance.speedError) return false
+  const readyAt = instance.readyAt?.getTime()
+  if (readyAt == null) return true
+  return now - readyAt < SPEED_WAIT_MS
 }
 
 export function emptyCriteria(): Criteria {
