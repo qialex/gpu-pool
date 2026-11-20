@@ -1,8 +1,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
-import { timingSafeEqual } from "node:crypto"
+import { randomUUID, timingSafeEqual } from "node:crypto"
 import { clearSessionCookie, ensureOperator, login, logout, operatorIdFromRequest, sessionCookie } from "./auth.js"
 import { resolveToken, port, vastApiKey } from "./config.js"
-import { blacklistMachine, deleteInstance, getTemplate, listBlacklist, listInstanceEvents, listInstances, listMachineEvents, listTemplates, recordInstanceEvent, saveTemplateSettings, unbanMachine } from "./db.js"
+import { blacklistMachine, deleteCustomServer, deleteInstance, getTemplate, isCustomServerEnv, isCustomServerType, listActiveCustomServers, listBlacklist, listCustomServers, listInstanceEvents, listInstances, listMachineEvents, listTemplates, recordInstanceEvent, saveCustomServer, saveTemplateSettings, unbanMachine, type CustomServerEnv, type CustomServerRow } from "./db.js"
 import { upstashUsage } from "./upstash-usage.js"
 import { optionalNumber, parseCriteria, parseOptimize, renderApp, renderLogin, snapshotParts, usageText } from "./operator/page.js"
 import { isTag } from "./policy.js"
@@ -56,7 +56,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (req.method === "GET" && url.pathname === "/") {
-    const [templates, instances, blacklist] = await Promise.all([listTemplates(), listInstances(), listBlacklist()])
+    const [templates, instances, blacklist, customServers] = await Promise.all([listTemplates(), listInstances(), listBlacklist(), listCustomServers()])
     const unbanned = url.searchParams.get("unbanned")
     const banned = url.searchParams.get("banned")
     const ban = url.searchParams.get("ban")
@@ -82,7 +82,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
                       : url.searchParams.get("saved")
                         ? "Saved."
                         : ""
-    send(res, 200, "text/html; charset=utf-8", renderApp(templates, instances, blacklist, notice))
+    send(res, 200, "text/html; charset=utf-8", renderApp(templates, instances, blacklist, customServers, notice))
     return
   }
 
@@ -183,6 +183,39 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return
   }
 
+  if (req.method === "POST" && url.pathname === "/custom-servers") {
+    const form = await readForm(req)
+    const row = customServerFromForm(randomUUID(), form)
+    if (!row) {
+      redirect(res, "/?saved=0")
+      return
+    }
+    await saveCustomServer(row)
+    redirect(res, "/?saved=1")
+    return
+  }
+
+  const customDelete = /^\/custom-servers\/([^/]+)\/delete$/.exec(url.pathname)
+  if (req.method === "POST" && customDelete) {
+    await deleteCustomServer(decodeURIComponent(customDelete[1] ?? ""))
+    redirect(res, "/?saved=1")
+    return
+  }
+
+  const customUpdate = /^\/custom-servers\/([^/]+)$/.exec(url.pathname)
+  if (req.method === "POST" && customUpdate) {
+    const id = decodeURIComponent(customUpdate[1] ?? "")
+    const form = await readForm(req)
+    const row = customServerFromForm(id, form)
+    if (!row) {
+      redirect(res, "/?saved=0")
+      return
+    }
+    await saveCustomServer(row)
+    redirect(res, "/?saved=1")
+    return
+  }
+
   const templateMatch = /^\/templates\/([^/]+)$/.exec(url.pathname)
   if (req.method === "POST" && templateMatch) {
     const hashId = decodeURIComponent(templateMatch[1] ?? "")
@@ -279,8 +312,11 @@ async function handleResolve(req: IncomingMessage, res: ServerResponse, url: URL
   }
   const tag = url.searchParams.get("tag") ?? url.searchParams.get("role") ?? ""
   if (!tag) {
-    const endpoints = await resolveAll()
-    send(res, 200, "application/json", JSON.stringify(endpoints))
+    const [endpoints, customServers] = await Promise.all([resolveAll(), listActiveCustomServers()])
+    send(res, 200, "application/json", JSON.stringify({
+      endpoints,
+      customServers: customServers.map(publicCustomServer),
+    }))
     return
   }
   if (!isTag(tag)) {
@@ -293,6 +329,45 @@ async function handleResolve(req: IncomingMessage, res: ServerResponse, url: URL
     return
   }
   send(res, 200, "application/json", JSON.stringify(endpoint))
+}
+
+function customServerFromForm(id: string, form: URLSearchParams): CustomServerRow | null {
+  const ip = (form.get("ip") ?? "").trim()
+  const port = Number(form.get("port"))
+  const type = form.get("type") ?? ""
+  if (!ip || !Number.isInteger(port) || port < 1 || port > 65535 || !isCustomServerType(type)) return null
+  const env = form.getAll("env").filter(isCustomServerEnv)
+  return {
+    id,
+    ip,
+    port,
+    type,
+    http: form.get("http") === "1",
+    https: form.get("https") === "1",
+    selfSigned: form.get("self_signed") === "1",
+    active: form.get("active") === "1",
+    env,
+  }
+}
+
+function publicCustomServer(row: CustomServerRow): {
+  ip: string
+  port: number
+  type: CustomServerRow["type"]
+  http: boolean
+  https: boolean
+  selfSigned: boolean
+  env: CustomServerEnv[]
+} {
+  return {
+    ip: row.ip,
+    port: row.port,
+    type: row.type,
+    http: row.http,
+    https: row.https,
+    selfSigned: row.selfSigned,
+    env: row.env,
+  }
 }
 
 function authorized(req: IncomingMessage): boolean {

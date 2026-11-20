@@ -125,12 +125,39 @@ type PendingDoc = { offerId: number; templateHashId: string; createdAt: string }
 
 type BlacklistDoc = Omit<BlacklistRow, "bannedUntil" | "updatedAt"> & { bannedUntil: string; updatedAt: string }
 
+export const CUSTOM_SERVER_TYPES = ["confyui_qwen_2_1"] as const
+export type CustomServerType = (typeof CUSTOM_SERVER_TYPES)[number]
+
+export const CUSTOM_SERVER_ENVS = ["production", "staging", "dev"] as const
+export type CustomServerEnv = (typeof CUSTOM_SERVER_ENVS)[number]
+
+export type CustomServerRow = {
+  id: string
+  ip: string
+  port: number
+  type: CustomServerType
+  http: boolean
+  https: boolean
+  selfSigned: boolean
+  active: boolean
+  env: CustomServerEnv[]
+}
+
+export function isCustomServerType(value: string): value is CustomServerType {
+  return (CUSTOM_SERVER_TYPES as readonly string[]).includes(value)
+}
+
+export function isCustomServerEnv(value: string): value is CustomServerEnv {
+  return (CUSTOM_SERVER_ENVS as readonly string[]).includes(value)
+}
+
 const KEYS = {
   templates: "doc:templates",
   instances: "doc:instances",
   pending: "doc:pending",
   blacklist: "doc:blacklist",
   events: "doc:events",
+  customServers: "doc:custom-servers",
 }
 
 const EVENT_TTL_MS = 7 * 24 * 60 * 60 * 1000
@@ -424,6 +451,26 @@ export async function bannedMachineIds(now = new Date()): Promise<Set<number>> {
   return new Set((await listBlacklist(now)).map(row => row.machineId))
 }
 
+export async function listCustomServers(): Promise<CustomServerRow[]> {
+  const docs = await readDoc<CustomServerRow[]>(KEYS.customServers, [])
+  return docs.filter(isCustomServerRow).sort((a, b) => a.ip.localeCompare(b.ip) || a.port - b.port)
+}
+
+export async function listActiveCustomServers(): Promise<CustomServerRow[]> {
+  return (await listCustomServers()).filter(row => row.active)
+}
+
+export async function saveCustomServer(row: CustomServerRow): Promise<void> {
+  await updateDoc<CustomServerRow[]>(KEYS.customServers, [], docs => [
+    ...docs.filter(doc => doc.id !== row.id),
+    row,
+  ])
+}
+
+export async function deleteCustomServer(id: string): Promise<void> {
+  await updateDoc<CustomServerRow[]>(KEYS.customServers, [], docs => docs.filter(doc => doc.id !== id))
+}
+
 export async function deleteOperators(): Promise<void> {
   await redis([["DEL", "doc:operators"]])
 }
@@ -439,6 +486,19 @@ export async function sessionExists(token: string): Promise<boolean> {
 
 export async function deleteSession(token: string): Promise<void> {
   await redis([["DEL", `session:${token}`]])
+}
+
+function isCustomServerRow(value: CustomServerRow): boolean {
+  return typeof value?.id === "string"
+    && typeof value.ip === "string"
+    && Number.isInteger(value.port)
+    && isCustomServerType(value.type)
+    && typeof value.http === "boolean"
+    && typeof value.https === "boolean"
+    && typeof value.selfSigned === "boolean"
+    && typeof value.active === "boolean"
+    && Array.isArray(value.env)
+    && value.env.every(isCustomServerEnv)
 }
 
 function normalizeOptimizeGoal(goal: OptimizeGoal): OptimizeGoal {

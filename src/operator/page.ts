@@ -1,4 +1,4 @@
-import type { BlacklistRow, InstanceRow, TemplateRow } from "../db.js"
+import { CUSTOM_SERVER_ENVS, CUSTOM_SERVER_TYPES, type BlacklistRow, type CustomServerRow, type InstanceRow, type TemplateRow } from "../db.js"
 import type { UpstashUsage } from "../upstash-usage.js"
 import {
   OPTIMIZE_FIELD_LABELS,
@@ -30,6 +30,7 @@ export function renderApp(
   templates: TemplateRow[],
   instances: InstanceRow[],
   blacklist: BlacklistRow[],
+  customServers: CustomServerRow[],
   notice: string,
 ): string {
   const parts = snapshotParts(templates, instances, blacklist)
@@ -46,6 +47,7 @@ export function renderApp(
     ${notice ? `<p class="notice">${esc(notice)}</p>` : ""}
     <section id="templates">${parts.templates}</section>
     <section id="rented">${parts.rented}</section>
+    <section id="custom-servers">${customServersSection(customServers)}</section>
     <section id="blacklist">${parts.blacklist}</section>
     <dialog id="logs">
       <div class="title">
@@ -144,6 +146,49 @@ function liveChecksScript(): string {
       return String(value ?? "").replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\\"": "&quot;" }[ch]))
     }
   </script>`
+}
+
+function customServersSection(servers: CustomServerRow[]): string {
+  return `
+    <h2>Custom servers</h2>
+    <p class="muted">Added by hand. They stay stored and are not probed. The resolve API returns the active ones.</p>
+    ${customServerForm(null)}
+    ${servers.map(server => customServerForm(server)).join("")}
+  `
+}
+
+function customServerForm(server: CustomServerRow | null): string {
+  const action = server ? `/custom-servers/${esc(server.id)}` : "/custom-servers"
+  const envs = new Set(server?.env ?? [])
+  return `
+    <div class="card">
+    <form method="post" action="${action}">
+      <div class="title">
+        <strong>${server ? esc(server.ip) + ":" + esc(server.port) : "New custom server"}</strong>
+      </div>
+      <div class="grid">
+        <label>IP <input name="ip" value="${esc(server?.ip ?? "")}" required></label>
+        <label>Port <input name="port" inputmode="numeric" value="${server ? esc(server.port) : ""}" required></label>
+        <label>Type
+          <select name="type">
+            ${CUSTOM_SERVER_TYPES.map(type => `<option value="${type}"${server?.type === type ? " selected" : ""}>${type}</option>`).join("")}
+          </select>
+        </label>
+        <label>Env
+          <select name="env" multiple size="${CUSTOM_SERVER_ENVS.length}">
+            ${CUSTOM_SERVER_ENVS.map(env => `<option value="${env}"${envs.has(env) ? " selected" : ""}>${env}</option>`).join("")}
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" name="http" value="1"${server?.http ? " checked" : ""}> HTTP</label>
+        <label class="check"><input type="checkbox" name="https" value="1"${server?.https ? " checked" : ""}> HTTPS</label>
+        <label class="check"><input type="checkbox" name="self_signed" value="1"${server?.selfSigned ? " checked" : ""}> Self-signed cert</label>
+        <label class="check"><input type="checkbox" name="active" value="1"${server?.active ? " checked" : ""}> Active</label>
+      </div>
+      <button type="submit">${server ? "Save" : "Add"}</button>
+    </form>
+    ${server ? `<form method="post" action="/custom-servers/${esc(server.id)}/delete"><button type="submit" class="ghost">Delete</button></form>` : ""}
+    </div>
+  `
 }
 
 function templateCard(template: TemplateRow): string {
